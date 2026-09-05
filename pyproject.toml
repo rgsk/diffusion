@@ -18,4 +18,3 @@ dev = [
 
 [tool.ruff]
 src = ["src"]                 # so forward_process, unet, ... sort as first-party
-extend-exclude = ["*.ipynb"]  # walkthroughs are scratch, not linted
