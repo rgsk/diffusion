@@ -10,7 +10,7 @@
     },
     "notebook.formatOnSave.enabled": true,
     "notebook.codeActionsOnSave": {
-        "notebook.source.organizeImports.ruff": "explicit",
-        "notebook.source.fixAll.ruff": "explicit"
+        "notebook.source.organizeImports.ruff": "never",
+        "notebook.source.fixAll.ruff": "never"
     }
 }
