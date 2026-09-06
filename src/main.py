@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from torchvision.utils import save_image
 
+from ddim import DDIMSampler
 from forward_process import ForwardProcess
 from sampler import DDPMSampler
 from unet import UNet
@@ -47,12 +48,21 @@ def logger(out: Path):
     return log
 
 
+def build_sampler(fp: ForwardProcess, kind: str, ddim_steps: int):
+    """DDIM at 50 steps costs ~1s a grid against DDPM's ~15s; DDPM stays the
+    reference, since it is the process the loss is actually derived from."""
+    assert kind in ("ddim", "ddpm"), kind
+    return DDPMSampler(fp) if kind == "ddpm" else DDIMSampler(fp, steps=ddim_steps)
+
+
 def main(
     epochs: int = 5,
     batch_size: int = 128,
     lr: float = 2e-4,
     n_samples: int = 64,
     name: str = "scratch",
+    sampler: str = "ddim",
+    ddim_steps: int = 50,
 ):
     root = repo_root()
     out = run_dir(name)
@@ -72,11 +82,12 @@ def main(
 
     fp = ForwardProcess().to(dev)
     net = UNet().to(dev)
-    sampler = DDPMSampler(fp).to(dev)
+    smp = build_sampler(fp, sampler, ddim_steps).to(dev)
     opt = torch.optim.Adam(net.parameters(), lr=lr)
     log(
         f"out {out}\n"
         f"epochs {epochs}  batch {batch_size}  lr {lr}  n_samples {n_samples}\n"
+        f"sampler {sampler}  {getattr(smp, 'steps', fp.T)} steps\n"
         f"device {dev}  params {sum(p.numel() for p in net.parameters()) / 1e6:.2f}M  "
         f"{len(loader)} steps/epoch"
     )
@@ -97,7 +108,7 @@ def main(
 
         net.eval()
         start = time.time()
-        x = sampler.sample(net, (n_samples, 1, 28, 28), dev)
+        x = smp.sample(net, (n_samples, 1, 28, 28), dev)
         save_image(
             x.cpu(),
             out / f"samples_epoch{epoch:02d}.png",
@@ -127,6 +138,13 @@ def parse_args() -> argparse.Namespace:
         help="run label; 'scratch' reuses artifacts/scratch, anything else gets "
         "its own timestamped folder",
     )
+    p.add_argument(
+        "--sampler",
+        default="ddim",
+        choices=("ddim", "ddpm"),
+        help="sampler for the per-epoch grid",
+    )
+    p.add_argument("--ddim-steps", type=int, default=50, help="ignored for ddpm")
     return p.parse_args()
 
 
