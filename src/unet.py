@@ -6,6 +6,7 @@ from torch import Tensor, nn
 
 from attention import Attention
 from resblock import ResBlock
+from text_encoder import TextBlock, TextEncoder
 from timestep_embedding import timestep_embedding
 
 
@@ -32,7 +33,8 @@ class Upsample(nn.Module):
 class UNet(nn.Module):
     """Predicts eps from (x_t, t), and from conditioning: a class label when
     `num_classes` is set, or a caption when `vocab_size` is (`pooled=True` for
-    the pooled-into-temb baseline instead). Output conv is
+    the pooled-into-temb baseline instead; `text_layers>0` contextualises the
+    tokens first). Output conv is
     zero-init, so a fresh net predicts exactly zero noise and the MSE loss starts
     at E[eps²] = 1.
 
@@ -58,6 +60,7 @@ class UNet(nn.Module):
         max_tokens: int = 32,
         null_token: int = 0,
         pooled: bool = False,
+        text_layers: int = 0,
     ):
         super().__init__()
         self.base, self.mults = base, mults
@@ -80,9 +83,20 @@ class UNet(nn.Module):
             assert 0 <= null_token < vocab_size, (null_token, vocab_size)
             self.null_label = null_token
             self.token_emb = nn.Embedding(vocab_size, context_dim)
-            # zero-init, so the sequence starts as a pure bag of words and any
-            # order-dependence the net acquires is learned rather than assumed
             self.token_pos = nn.Parameter(torch.zeros(1, max_tokens, context_dim))
+            # Zero-init starts the sequence as a pure bag of words, so any
+            # order-dependence is learned rather than assumed. Measured cost of
+            # that purity (`results.md`): token_pos trained to 2% of the
+            # embedding norm and never became a usable signal, because the net
+            # can drive the loss down on word identity alone. With an encoder to
+            # read them, positions get a real init and a running start.
+            self.text = (
+                TextEncoder(context_dim, text_layers, cross_heads)
+                if text_layers
+                else None
+            )
+            if self.text is not None:
+                nn.init.normal_(self.token_pos, std=0.02)
             # the baseline this item exists to beat: mean the sequence into one
             # vector and add it to temb, exactly as a class label is added. Every
             # word still reaches the net; nothing records which word goes with
@@ -150,6 +164,10 @@ class UNet(nn.Module):
             )
             assert 0 <= int(y.min()) and int(y.max()) < self.vocab_size, y
             context = self.token_emb(y) + self.token_pos[:, : y.shape[1]]
+            if self.text is not None:
+                # each word rewritten in terms of the others, before any pixel
+                # attends to it -- the stage a real model gets from CLIP
+                context = self.text(context)
             if self.pooled:
                 temb = temb + self.context_pool(context.mean(1))
                 context = None  # nothing downstream reads it; there is no reader
@@ -459,5 +477,40 @@ if __name__ == "__main__":
         assert torch.allclose(
             a, pnet(xt3, tc, toks[:, torch.randperm(SEQ_LEN)]), atol=1e-5
         )
+
+    # 13. the text encoder: the stage that makes the context worth attending to.
+    #     Without it, the vector at slot 1 is the word "red" plus a positional
+    #     offset that trained to 2% of its norm (results.md), so cross-attention
+    #     assigns attributes at chance. The property to check is that a token's
+    #     vector now depends on the other tokens.
+    enc = UNet(in_ch=3, vocab_size=V, text_layers=2)
+    assert enc.text is not None and len(enc.text.blocks) == 2
+    assert enc.token_pos.abs().max() > 0, "positions must not start at zero here"
+    assert UNet(in_ch=3, vocab_size=V).token_pos.abs().max() == 0  # control unchanged
+    assert enc(xt3, tc, toks).shape == xt3.shape
+    assert torch.equal(enc(xt3, tc, toks), torch.zeros_like(xt3))  # zero-init holds
+
+    def context_of(net, tok):
+        c = net.token_emb(tok) + net.token_pos[:, : tok.shape[1]]
+        return net.text(c) if net.text is not None else c
+
+    with torch.no_grad():
+        for m in enc.text.modules():  # de-zero, or the encoder is the identity
+            if isinstance(m, TextBlock):
+                nn.init.normal_(m.proj.weight, std=0.05)
+                nn.init.normal_(m.mlp[-1].weight, std=0.05)
+        swapped = toks.clone()
+        swapped[:, [1, 4]] = swapped[:, [4, 1]]  # exchange two words
+        plain = UNet(in_ch=3, vocab_size=V)
+        # without the encoder, exchanging two words leaves every *other* slot
+        # untouched -- the context is a bag with position tags
+        a, b = context_of(plain, toks), context_of(plain, swapped)
+        assert torch.equal(a[:, 2], b[:, 2])
+        # with it, a word that did not move still changes, because it is now
+        # described in terms of the words that did
+        c, d = context_of(enc, toks), context_of(enc, swapped)
+        moved = (c[:, 2] - d[:, 2]).abs().max()
+        print(f"unmoved token changes by {moved:.4f} once the encoder reads it")
+        assert moved > 1e-3
 
     print("ok")

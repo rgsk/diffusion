@@ -411,3 +411,132 @@ left and a blue 7 in the bottom right". Then the pooled vector carries {red, 3,
 blue, 7, top-left, bottom-right} with no record of which colour goes with which
 digit, and the sum genuinely cannot represent the answer. That is the next item,
 and this run is the control it needs.
+
+## Two objects — `pair_cross_2026-09-09_22-09-02` vs `pair_pooled_2026-09-09_22-51-58`
+
+The control the previous section asked for. Two digits per 32x32 canvas, two
+distinct colours, two distinct corners, one caption naming both: "a red 3 in the
+top left and a blue 7 in the bottom right". Now the assignment is not recoverable
+from the multiset of words, so a pooled caption provably cannot express it.
+
+30 epochs each, batch 64, `--seed 0`, w=3. Scored by `binding.py`: each named
+corner is blanked out of the canvas and read separately, colour off the pixels
+and digit by the same judge as before. `colours present` asks whether both
+colours appear anywhere; `colours bound` asks whether each is on its own digit.
+The gap between them is the binding failure.
+
+| | colours present | colours bound | colours swapped | digits bound | both bound |
+| --- | --- | --- | --- | --- | --- |
+| control (real images) | 1.000 | 1.000 | 0.000 | 0.934 | 0.934 |
+| cross-attention | 0.842 | 0.405 | 0.436 | 0.396 | 0.183 |
+| pooled | 0.844 | 0.418 | 0.426 | 0.390 | 0.193 |
+
+**The binding failure reproduces exactly, and cross-attention does not fix it.**
+Both models paint the right two colours and the right two digits and then assign
+them to positions at chance. If a model gets both colours into the image and then
+picks an assignment by coin flip, it scores `present/2` on bound: predicted 0.421
+and 0.422, observed 0.405 and 0.418. Not approximately chance — chance.
+
+This is the "red cube and blue sphere" failure, at MNIST cost. The words are all
+there; the binding is not.
+
+**Why cross-attention did not help, which is the actual finding.** The context it
+attends to is raw token embeddings plus a learned positional offset, and that
+offset never grew:
+
+| | mean norm per token |
+| --- | --- |
+| `token_emb` (word identity) | 11.19 |
+| `token_pos` (which slot) | 0.235 |
+
+Two percent. So the vector at slot 1 is "red" and the vector at slot 9 is "blue",
+with almost nothing recording that one sits in the first clause and one in the
+second. Attending to that sequence is attending to a bag. Exchanging the two
+colour words moves the prediction by 0.0104 for cross-attention against 0.0008
+for pooled — thirteen times more responsive, and both negligible against an eps
+of order 1.
+
+Cross-attention supplies a *mechanism* for per-position lookup. It does not
+supply anything to look up. In a real text-to-image model the tokens arrive from
+a transformer text encoder, whose self-attention has already contextualised them:
+the vector at "red" encodes *red, modifying the 3, in the first clause* before
+cross-attention ever sees it. That contextualisation is the part doing the
+binding, and this project does not have it. Zero-initialising `token_pos` made it
+worse — the net can drive the loss down on word identity alone, so the gradient
+pressure to grow a positional signal is weak and it stays near zero.
+
+The eps-MSE is blind again, to three decimals at every bucket (0.0098 pooled
+scalar for both; 0.0334 vs 0.0331 at t=0-99, 0.0006 vs 0.0006 at t=900-999). Three
+runs now where the training loss cannot see the question being asked.
+
+Caveats. `both bound` is capped near 0.93 by judge error on isolated corners, so
+read the colour columns, which the control reads perfectly. 16% of samples do not
+contain both requested colours at all, which is a separate and smaller failure
+folded into `present`. And "cross-attention does not help *here*" is a statement
+about a context with no text encoder in front of it — not about cross-attention.
+
+What this predicts: give the tokens a real encoder — self-attention over the
+sequence, positional embeddings that actually train — and `colours bound` should
+separate from `present` in a way neither run above shows. That is the next item,
+and these two runs are its control.
+
+## A text encoder does not fix binding — `pair_encoder_2026-09-09_23-46-51`
+
+The previous section blamed the context: cross-attention had only word embeddings
+plus a positional offset at 2% of their norm to look up, so attending to it was
+attending to a bag. The fix should have been self-attention over the tokens,
+which is the stage a real model gets from CLIP. Two blocks, `--text-layers 2`,
+5.12M params against 4.72M, everything else identical to `pair_cross`.
+
+Stated in advance: `colours bound` should separate from `colours present`.
+
+| | colours present | colours bound | colours swapped | both bound |
+| --- | --- | --- | --- | --- |
+| pooled | 0.844 | 0.418 | 0.426 | 0.193 |
+| cross-attention | 0.842 | 0.405 | 0.436 | 0.183 |
+| cross-attention + text encoder | 0.840 | **0.402** | 0.438 | 0.177 |
+
+**It did not move.** Still `present/2`, still chance. The prediction was wrong.
+
+The encoder is not what failed. It trained — both zero-init projections in both
+blocks grew off zero (attention `|W|` 2.43, MLP `|W|` 3.21) — and it
+contextualises: changing the word at slot 9 moves the vector at slot 2 by 0.064,
+which is exactly the property the old context lacked. The stage works. It changes
+nothing downstream.
+
+Where it actually breaks, measured on real images by scoring a correct caption
+against the same caption with its two colour words exchanged:
+
+| t | correct | colour-swapped | null | swap/correct | null/correct |
+| --- | --- | --- | --- | --- | --- |
+| 0-199 | 0.0221 | 0.0221 | 0.0230 | **1.000** | 1.038 |
+| 400-599 | 0.0070 | 0.0070 | 0.0080 | **1.000** | 1.141 |
+| 800-999 | 0.0012 | 0.0012 | 0.0019 | **1.000** | 1.612 |
+
+The caption is used, and used hardest exactly where it should be — at high `t`
+the model is 61% better with it than without. The *assignment inside* the caption
+is worth nothing anywhere. Not "less at low t", where `x_t` already shows the
+colours: nothing, at every noise level, to three decimals.
+
+So the model never learned to condition on which colour goes with which digit,
+and the failure is upstream of both the encoder and the sampler. Guidance does
+not recover it either — `colours bound` is flat from w=1 to w=12 (0.500, 0.481,
+0.488, 0.481) while `colours present` holds at 0.94. There is no weak signal for
+guidance to amplify.
+
+**The next suspect is the image side, not the text side.** Cross-attention binds
+by matching a query against the words that concern it, and the query is a feature
+vector at one spatial location. Convolutions are translation-equivariant, so
+those features carry no absolute coordinates beyond what zero-padding leaks. A
+query in the top-left cannot reliably say *I am the top-left one*, and if it
+cannot say that, it cannot select the clause that names it — however well
+contextualised the clause is.
+
+This fits what the single-object runs did: those placed digits at named positions
+perfectly (1.000), but that needs no per-position discrimination — one global
+instruction moves the only object. Two objects need the top-left features to
+select clause 1 while the bottom-right features select clause 2, in the same
+forward pass. That is the capability nothing here has.
+
+Four runs now with the same eps-MSE to four decimals (0.0098, 0.0098, and 0.0098)
+and four different answers to the question that matters.

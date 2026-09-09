@@ -49,6 +49,10 @@ VOCAB = (
     *COLORS,
     *DIGITS,
     *sorted({w for p in POSITIONS for w in p.split()}),
+    # appended, not inserted: every id above keeps the value it had, so a
+    # checkpoint trained on the 26-word vocabulary still loads and still encodes
+    # its captions to exactly the same tokens. Used only by `two_objects`.
+    "and",
 )
 WORD2ID = {w: i for i, w in enumerate(VOCAB)}
 NULL, PAD = 0, 1
@@ -71,25 +75,25 @@ def caption(color: str, digit: str, position: str) -> str:
     return f"a {color} {digit} in the {position}"
 
 
-def encode(text: str) -> Tensor:
-    """Caption -> [SEQ_LEN] token ids, right-padded. Whitespace is the tokenizer:
+def encode(text: str, length: int = SEQ_LEN) -> Tensor:
+    """Caption -> [length] token ids, right-padded. Whitespace is the tokenizer:
     the vocabulary is closed, so every word is a known id or a typo worth raising."""
     ids = [WORD2ID[w] for w in text.split()]
-    assert len(ids) <= SEQ_LEN, (text, len(ids))
-    return torch.tensor(ids + [PAD] * (SEQ_LEN - len(ids)), dtype=torch.long)
+    assert len(ids) <= length, (text, len(ids), length)
+    return torch.tensor(ids + [PAD] * (length - len(ids)), dtype=torch.long)
 
 
 def decode(ids: Tensor) -> str:
     return " ".join(VOCAB[i] for i in ids.tolist() if i != PAD)
 
 
-def null_tokens(n: int, device=None) -> Tensor:
+def null_tokens(n: int, length: int = SEQ_LEN, device=None) -> Tensor:
     """The unconditional prompt: no words at all, only the null token."""
-    return torch.full((n, SEQ_LEN), NULL, dtype=torch.long, device=device)
+    return torch.full((n, length), NULL, dtype=torch.long, device=device)
 
 
-def encode_batch(texts: list[str], device=None) -> Tensor:
-    return torch.stack([encode(t) for t in texts]).to(device)
+def encode_batch(texts: list[str], device=None, length: int = SEQ_LEN) -> Tensor:
+    return torch.stack([encode(t, length) for t in texts]).to(device)
 
 
 def attributes(i: int, seed: int) -> tuple[int, int]:
@@ -229,6 +233,9 @@ if __name__ == "__main__":
     assert (encode(caption("red", "3", "top left"))[-1] != PAD).item()
     assert (null_tokens(4) == NULL).all() and null_tokens(4).shape == (4, SEQ_LEN)
     print(f"vocab {len(VOCAB)} words, {SEQ_LEN} tokens/caption: {' '.join(VOCAB)}")
+    # "and" is appended, so nothing a 26-word checkpoint encodes has moved
+    assert VOCAB.index("and") == len(VOCAB) - 1 == 26
+    assert max(int(i) for i in encode(caption("red", "3", "top left"))) < 26
 
     # 2. an unknown word is a raise, not a silent id -- a typo'd prompt that
     #    quietly encodes to something is the worst possible failure here

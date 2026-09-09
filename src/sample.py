@@ -44,6 +44,7 @@ def load(run: str, device: str, weights: str = "ema"):
         attention=attention,
         vocab_size=V,
         pooled=ck.get("pooled", False),
+        text_layers=ck.get("text_layers", 0),
     )
     net.load_state_dict(state)
     fp = ForwardProcess()

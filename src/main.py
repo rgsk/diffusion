@@ -23,6 +23,7 @@ from ema import EMA
 from forward_process import ForwardProcess
 from loss_by_t import LossByT
 from sampler import DDPMSampler
+from two_objects import TwoObjectMNIST, pair_prompt_grid
 from unet import UNet
 from utils import repo_root
 
@@ -88,8 +89,9 @@ def main(
     attention: bool = False,
     dataset: str = "mnist",
     pooled_context: bool = False,
+    text_layers: int = 0,
 ):
-    assert dataset in ("mnist", "colored"), dataset
+    assert dataset in ("mnist", "colored", "pair"), dataset
     root = repo_root()
     out = run_dir(name)
     log = logger(out)
@@ -98,8 +100,12 @@ def main(
     # differ in that flag alone
     torch.manual_seed(seed)
 
-    if dataset == "colored":
-        ds = ColoredMNIST(root=root / "data", train=True, seed=seed)
+    if dataset in ("colored", "pair"):
+        ds = (
+            ColoredMNIST(root=root / "data", train=True, seed=seed)
+            if dataset == "colored"
+            else TwoObjectMNIST(root=root / "data", train=True, seed=seed)
+        )
         # the caption replaces the label rather than joining it: the whole point
         # is that everything conditional goes through cross-attention
         in_ch, size, num_classes, vocab_size = 3, ds.size, 0, len(VOCAB)
@@ -123,6 +129,7 @@ def main(
         attention=attention,
         vocab_size=vocab_size,
         pooled=pooled_context,
+        text_layers=text_layers,
     ).to(dev)
     smp = build_sampler(fp, sampler, ddim_steps).to(dev)
     opt = torch.optim.Adam(net.parameters(), lr=lr)
@@ -136,7 +143,8 @@ def main(
         f"schedule {schedule}\n"
         f"classes {num_classes or 'unconditional'}  "
         f"vocab {vocab_size or '-'}"
-        f"{' (pooled into temb)' if vocab_size and pooled_context else ''}  "
+        f"{' (pooled into temb)' if vocab_size and pooled_context else ''}"
+        f"{f' text-encoder x{text_layers}' if vocab_size and text_layers else ''}  "
         f"ema {ema_decay or 'off'}  "
         f"label dropout {label_dropout}  guidance {guidance}  "
         f"attention {attention}\n"
@@ -148,7 +156,14 @@ def main(
 
     # (filename tag, tokens or labels, images per row); the first is the one the
     # log reports a range for
-    if vocab_size:
+    if dataset == "pair":
+        # rows come in pairs: a prompt, then the same prompt with its two colour
+        # words exchanged. A model that binds draws them differently; a model
+        # that pools draws them the same, and the grid says so without measuring.
+        yg, ng, prompts = pair_prompt_grid(dev)
+        grids = [("samples", yg, ng)]
+        log(f"grid: {len(prompts)} prompts\n  '{prompts[0]}'\n  '{prompts[ng]}'")
+    elif vocab_size:
         # every colour x every digit at one position: the six held-out cells are
         # in the picture, so the compositionality question is asked every epoch.
         # positions_ sweeps the axis prompt_grid pins, so a broken position
@@ -236,8 +251,10 @@ def main(
                 "attention": attention,
                 "vocab_size": vocab_size,
                 "pooled": pooled_context,
+                "text_layers": text_layers,
                 "in_ch": in_ch,
                 "image_size": size,
+                "dataset": dataset,
             },
             out / "ckpt.pt",
         )
@@ -294,15 +311,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--dataset",
         default="mnist",
-        choices=("mnist", "colored"),
+        choices=("mnist", "colored", "pair"),
         help="mnist: 28x28 grayscale, class-conditioned. colored: 32x32 RGB "
-        "digits with captions, conditioned by cross-attention",
+        "captioned digits, one per image. pair: two digits per image, where a "
+        "pooled caption cannot say which colour goes with which digit",
     )
     p.add_argument(
         "--pooled-context",
         action="store_true",
         help="baseline for --dataset colored: mean the caption into one vector and "
         "add it to temb, the way a class label is added, instead of cross-attention",
+    )
+    p.add_argument(
+        "--text-layers",
+        type=int,
+        default=0,
+        help="self-attention blocks over the token sequence before the U-Net "
+        "reads it; 0 reproduces the runs that assign attributes at chance",
     )
     p.add_argument(
         "--attention",

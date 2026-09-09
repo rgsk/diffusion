@@ -93,6 +93,26 @@ showed live in `results.md`.
 - `main.py --dataset colored` — trains the captioned net; the per-epoch grid is
   every colour x every digit, so the held-out cells are in the picture from
   epoch 1.
+- `two_objects.py` — two digits on one canvas, distinct colours, digits and
+  corners, one caption naming both. The setting where the assignment is not
+  recoverable from the multiset of words, which single-object images never were.
+  `swap_colors` exchanges the two colour words (the probe the eval rests on) and
+  `isolate` blanks all but one corner, so the single-object judge scores a
+  two-object image without retraining.
+- `binding.py` — scores `colours present` (what a bag of words can get right)
+  against `colours bound` (which colour went where). Measured in `results.md`:
+  **both mechanisms assign at chance**, and cross-attention is no better than
+  pooling, because `token_pos` trained to 2% of the token embedding norm and the
+  context is therefore still a bag. The failure mode is the clean swap, counted
+  directly.
+- `text_encoder.py` — pre-norm self-attention + MLP over `[B, L, D]`, so each
+  word's vector is rewritten in terms of the words around it before any pixel
+  attends to it: the stage a real model gets from CLIP. Zero-init residual
+  projections, as everywhere else here, and it does not own the embedding table,
+  so every earlier captioned checkpoint still loads as the control.
+  `UNet(text_layers=n)`, `main.py --text-layers`. Measured in `results.md`: it
+  trains, it contextualises, and it **does not fix binding** — the failure is on
+  the image side of the attention, not the text side.
 - `compositional.py` — the held-out eval. Generates every colour x digit pair,
   scores colour and position off the pixels and the digit with a small CNN judge
   trained on the *full* dataset (a judge that never saw a red 3 cannot grade
@@ -113,18 +133,23 @@ showed live in `results.md`.
 
 ## Next
 
-Ordered. (1) is unfinished business: the compositionality item above built the
-mechanism and then failed to find a task that needs it.
+Ordered. (1) is unfinished business: the binding item built the mechanism, found
+the task that needs it, and then found that the mechanism alone is not enough.
 
-1. **Two digits per image** — "a red 3 in the top left and a blue 7 in the
-   bottom right". `pooled_2026-09-09_21-26-36` showed that one object per image
-   cannot distinguish cross-attention from a bag of words, because a bag is
-   unambiguous when there is only one slot to empty it into. Two objects is the
-   smallest change that makes {red, 3, blue, 7} genuinely ambiguous, and it is
-   the setting the "red cube and blue sphere" failure actually lives in. The
-   dataset, the caption template and the eval all extend rather than change:
-   score each object separately and add a swapped-attribute failure mode. The
-   two runs already trained are the control.
+1. **Spatial coordinates in the image stream** — a 2D positional embedding
+   added to the feature maps the cross-attention queries are built from.
+   `results.md` has three runs failing binding at chance (pooled, cross-attention,
+   cross-attention + text encoder) and a diagnosis that rules out the text side:
+   the encoder demonstrably contextualises, and the U-Net's eps is *identical*
+   for a caption and its colour-swapped twin at every noise level, so nothing
+   about the assignment is ever encoded. Cross-attention binds by matching a
+   query to the words about it, and the query is a feature vector at a location
+   that, after translation-equivariant convolutions, does not know where it is.
+   Add coordinates and the query can say *I am the top-left one*. `binding.py` is
+   the eval unchanged and three runs are the control. If this also fails at
+   chance, the next suspects are capacity at 128-dim context for two full object
+   descriptions, and a loss that pays ~1.6x for the caption and 1.0x for its
+   internal structure.
 
 2. **Flow matching / rectified flow** — DDPM/DDIM is the SD1/SD2-era
    formulation; SD3 and Flux use a straight-line path from noise to data,
