@@ -74,11 +74,16 @@ def main(
     num_classes: int = 10,
     loss_buckets: int = 10,
     ema_decay: float = 0.999,
+    schedule: str = "linear",
+    seed: int = 0,
 ):
     root = repo_root()
     out = run_dir(name)
     log = logger(out)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
+    # init, shuffling, and every noise draw -- so two runs differing in one flag
+    # differ in that flag alone
+    torch.manual_seed(seed)
 
     ds = datasets.MNIST(
         root=root / "data",
@@ -91,7 +96,7 @@ def main(
         ds, batch_size=batch_size, shuffle=True, num_workers=4, drop_last=True
     )
 
-    fp = ForwardProcess().to(dev)
+    fp = ForwardProcess(schedule=schedule).to(dev)
     net = UNet(num_classes=num_classes or None).to(dev)
     smp = build_sampler(fp, sampler, ddim_steps).to(dev)
     opt = torch.optim.Adam(net.parameters(), lr=lr)
@@ -100,9 +105,11 @@ def main(
     log(
         f"out {out}\n"
         f"epochs {epochs}  batch {batch_size}  lr {lr}  n_samples {n_samples}\n"
-        f"sampler {sampler}  {getattr(smp, 'steps', fp.T)} steps\n"
+        f"sampler {sampler}  {getattr(smp, 'steps', fp.T)} steps  "
+        f"schedule {schedule}\n"
         f"classes {num_classes or 'unconditional'}  "
         f"ema {ema_decay or 'off'}\n"
+        f"seed {seed}\n"
         f"device {dev}  params {sum(p.numel() for p in net.parameters()) / 1e6:.2f}M  "
         f"{len(loader)} steps/epoch\n"
         f"loss by t:  {cols(labels, labels)}"
@@ -165,7 +172,7 @@ def main(
             {
                 "net": net.state_dict(),
                 "ema": ema.shadow if ema else None,  # None so a loader can tell
-                "fp": fp.state_dict(),
+                "fp": fp.state_dict(),  # the schedule rides along as buffers
                 "num_classes": num_classes,
             },
             out / "ckpt.pt",
@@ -213,6 +220,13 @@ def parse_args() -> argparse.Namespace:
         help="weight EMA for the sampled grid and the 'ema' checkpoint key; "
         "0 disables and samples from the trained weights",
     )
+    p.add_argument(
+        "--schedule",
+        default="cosine",
+        choices=("linear", "cosine"),
+        help="beta schedule for the forward process",
+    )
+    p.add_argument("--seed", type=int, default=0, help="init, shuffling, and noise")
     return p.parse_args()
 
 

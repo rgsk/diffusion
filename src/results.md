@@ -190,3 +190,71 @@ convincing by eye — a few digits differ in identity, neither set is obviously
 better. Across-sample std 0.3877 trained vs 0.3707 EMA. The measurable claim
 here is the held-out loss; the visible-quality claim from the literature is for
 longer runs and harder data than this.
+
+## Cosine vs linear schedule — closed form, no training
+
+`cosine_schedule.ipynb`. Both schedules are arithmetic, so this holds before any
+model exists.
+
+| | ᾱ < 0.5 at | steps at SNR < 0.1 | ᾱ_T |
+| --- | --- | --- | --- |
+| linear | t=259 | 52% | 4.04e-05 |
+| cosine | t=496 | 20% | 2.43e-09 |
+
+Linear spends **half its steps** where SNR < 0.1 — x_t is essentially noise and
+there is little left to predict — and reaches half-destroyed by t=259. Cosine
+pushes that to t=496 and cuts the near-noise region to a fifth of the steps.
+
+It is not "less noise overall": cosine ends four orders of magnitude *more*
+destroyed (ᾱ_T = 2e-9 vs 4e-5). Linear still leaks a trace of the image into
+x_T, which is a train/sample mismatch, since sampling starts from pure noise.
+Cosine is a better *allocation* of the same T steps at both ends.
+
+The digit strip in the notebook shows the same thing directly: same x₀, same ε,
+and linear's 3 is unreadable by t=500 while cosine's survives to t≈600.
+
+Whether it helps a trained model is the next section.
+
+## Cosine vs linear, trained — `sched_lin_2026-09-09_17-49-05` vs `sched_cos_2026-09-09_17-53-11`
+
+5 epochs each, `--seed 0`, identical in every flag but `--schedule`. Same init,
+shuffle, `t` draws and noise, so the schedule is the only difference. (Seeding
+arrived with this comparison; every earlier run in this file is unseeded.)
+
+**The printed loss is meaningless across schedules.** Linear ends at 0.0232 and
+cosine at 0.0400, and this says nothing — the same `t` is a different amount of
+noise under each, so the two numbers are averages over different tasks. Cosine's
+number is larger because cosine *spends more of its steps* at low noise, where
+eps-MSE is high. Reading these two scalars against each other would say linear
+won by 70%.
+
+Matched on ᾱ instead — at equal ᾱ the input `x_t` is literally the same tensor,
+and only the `t` index each net is told differs — on the held-out set, EMA
+weights:
+
+| ᾱ | t_lin | t_cos | linear | cosine | lin/cos |
+| --- | --- | --- | --- | --- | --- |
+| 0.99 | 27 | 56 | 0.10597 | 0.10480 | 1.011x |
+| 0.90 | 97 | 198 | 0.05892 | 0.05755 | 1.024x |
+| 0.70 | 184 | 363 | 0.03784 | 0.03718 | 1.018x |
+| 0.50 | 258 | 495 | 0.02928 | 0.02882 | 1.016x |
+| 0.30 | 342 | 627 | 0.02269 | 0.02253 | 1.007x |
+| 0.10 | 475 | 793 | 0.01308 | 0.01314 | 0.995x |
+| 0.03 | 587 | 887 | 0.00547 | 0.00571 | 0.959x |
+| 0.01 | 673 | 935 | 0.00213 | 0.00232 | 0.919x |
+| 0.001 | 825 | 979 | 0.00036 | 0.00057 | 0.629x |
+
+The trade is exactly the one the schedule was designed to make, and nothing
+more. Cosine is 1-2% better across the low-noise half, where it now spends its
+steps; linear is better in the high-noise tail, by up to 58% at ᾱ=0.001, because
+it spends half its budget there. Capacity moved; it was not created.
+
+No visual winner at this scale (`grid.png` in each run, same `x_T`, same labels):
+both are clean digits, across-sample std 0.3675 linear vs 0.3790 cosine.
+
+**Verdict: cosine is not a win on MNIST at 5 epochs.** The Improved-DDPM result
+is on 64x64 ImageNet, where the model is capacity-bound and the wasted
+high-noise steps are a real cost; here a 4.17M-param net on 28x28 has capacity
+to spare, so buying low-noise accuracy with high-noise accuracy nets out flat.
+The cheap 1-2% gain sits in the region that matters most for perceptual detail,
+which is the argument for keeping it — not the loss numbers.

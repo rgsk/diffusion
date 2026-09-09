@@ -3,6 +3,8 @@
 import torch
 from torch import Tensor, nn
 
+from cosine_schedule import cosine_betas
+
 
 def extract(a: Tensor, t: Tensor, shape: torch.Size) -> Tensor:
     """a[t] with trailing 1s so it broadcasts against x of `shape`."""
@@ -15,10 +17,23 @@ class ForwardProcess(nn.Module):
     """Linear beta schedule. nn.Module so .to() moves all five buffers together and
     the schedule rides along in the checkpoint."""
 
-    def __init__(self, T: int = 1000, beta_start: float = 1e-4, beta_end: float = 0.02):
+    def __init__(
+        self,
+        T: int = 1000,
+        beta_start: float = 1e-4,
+        beta_end: float = 0.02,
+        schedule: str = "linear",
+    ):
         super().__init__()
+        assert schedule in ("linear", "cosine"), schedule
         self.T = T
-        betas = torch.linspace(beta_start, beta_end, T)
+        # beta_start/beta_end parameterise the linear schedule only; cosine is
+        # defined by its ᾱ curve and ignores them
+        betas = (
+            torch.linspace(beta_start, beta_end, T)
+            if schedule == "linear"
+            else cosine_betas(T)
+        )
         alphas = 1.0 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
         self.register_buffer("betas", betas)
