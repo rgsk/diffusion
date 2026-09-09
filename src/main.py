@@ -185,7 +185,10 @@ def main(
                 "net": net.state_dict(),
                 "ema": ema.shadow if ema else None,  # None so a loader can tell
                 "fp": fp.state_dict(),  # the schedule rides along as buffers
+                # everything a loader needs to rebuild this net; without them the
+                # state_dict keys don't match and the failure is a stack trace
                 "num_classes": num_classes,
+                "attention": attention,
             },
             out / "ckpt.pt",
         )

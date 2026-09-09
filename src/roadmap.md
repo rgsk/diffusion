@@ -58,6 +58,11 @@ showed live in `results.md`.
   bottleneck (`main.py --attention`). Measured in `results.md`: **no effect on
   MNIST** — the convs already reach the whole image by the bottleneck. Kept for
   the cross-attention path it provides.
+- `sample.py` — ask a trained run for digits: `python sample.py <run> --label 3
+  --n 16 --w 3`. Rebuilds the net from the checkpoint alone (num_classes,
+  attention, schedule), EMA weights by default, `--label -1` for one class per
+  row. Checkpoints now record `attention` too; older ones are read off their own
+  weights.
 - `class_conditioning.ipynb` — probes against a trained checkpoint: label sweep
   at fixed `x_T`, the null row, right-vs-wrong label by `t`, conditional vs
   unconditional by `t`. Cell 1 is all imports and helpers; every probe below
