@@ -133,3 +133,26 @@ is the small residue after a near-clean image and recovering it divides by
 `sqrt(1-ᾱ) ≈ 0`, amplifying any error in the implied `x0`. So the per-epoch
 average is dominated by low `t` and hides gains at high `t`. Roadmap item 1,
 arrived early.
+
+## Loss by `t`, in the training loop — `loss_by_t.py`
+
+`main.py` now prints the split every epoch, accumulated from the training draws
+themselves. Two epochs, conditional, 10 buckets:
+
+```
+loss by t:    0-99 100-199 200-299 300-399 400-499 500-599 600-699 700-799 800-899 900-999
+epoch 1  loss 0.0775
+  by t:     0.2014  0.1127  0.0894  0.0758  0.0627  0.0533  0.0472  0.0448  0.0447  0.0435
+epoch 2  loss 0.0264
+  by t:     0.1122  0.0528  0.0370  0.0271  0.0181  0.0095  0.0041  0.0019  0.0012  0.0011
+```
+
+The offline probe's finding now shows up live, and one epoch of training makes
+it dramatically worse: epoch 1 spans 5x across `t`, epoch 2 spans 100x. The
+model learns high `t` almost immediately and then spends every later epoch on
+low `t` — which is exactly the region the pooled scalar already reflects, so the
+pooled number keeps moving while the buckets show *where*. Free: the per-sample
+errors were being computed and thrown away.
+
+Printed epoch loss is unchanged in meaning — it is the count-weighted pooled
+mean, identical to the old `F.mse_loss` average.

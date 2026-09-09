@@ -6,13 +6,13 @@ import time
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from torchvision.utils import save_image
 
 from ddim import DDIMSampler
 from forward_process import ForwardProcess
+from loss_by_t import LossByT
 from sampler import DDPMSampler
 from unet import Conditioned, UNet
 from utils import repo_root
@@ -55,6 +55,12 @@ def build_sampler(fp: ForwardProcess, kind: str, ddim_steps: int):
     return DDPMSampler(fp) if kind == "ddpm" else DDIMSampler(fp, steps=ddim_steps)
 
 
+def cols(cells: list[str], labels: list[str]) -> str:
+    """One column per t bucket, header and rows sharing widths so a loss sits
+    under the range it belongs to."""
+    return " ".join(c.rjust(max(len(lab), 6)) for c, lab in zip(cells, labels))
+
+
 def main(
     epochs: int = 5,
     batch_size: int = 128,
@@ -64,6 +70,7 @@ def main(
     sampler: str = "ddim",
     ddim_steps: int = 50,
     num_classes: int = 10,
+    loss_buckets: int = 10,
 ):
     root = repo_root()
     out = run_dir(name)
@@ -85,13 +92,15 @@ def main(
     net = UNet(num_classes=num_classes or None).to(dev)
     smp = build_sampler(fp, sampler, ddim_steps).to(dev)
     opt = torch.optim.Adam(net.parameters(), lr=lr)
+    labels = LossByT(fp.T, loss_buckets).labels
     log(
         f"out {out}\n"
         f"epochs {epochs}  batch {batch_size}  lr {lr}  n_samples {n_samples}\n"
         f"sampler {sampler}  {getattr(smp, 'steps', fp.T)} steps\n"
         f"classes {num_classes or 'unconditional'}\n"
         f"device {dev}  params {sum(p.numel() for p in net.parameters()) / 1e6:.2f}M  "
-        f"{len(loader)} steps/epoch"
+        f"{len(loader)} steps/epoch\n"
+        f"loss by t:  {cols(labels, labels)}"
     )
 
     if num_classes:
@@ -105,17 +114,22 @@ def main(
 
     for epoch in range(1, epochs + 1):
         net.train()
-        start, total = time.time(), 0.0
+        start = time.time()
+        by_t = LossByT(fp.T, loss_buckets, dev)
         for x0, y in loader:
             x0 = x0.to(dev)
             y = y.to(dev) if num_classes else None
             t = fp.sample_t(x0.shape[0], dev)
             noise = torch.randn_like(x0)
-            loss = F.mse_loss(net(fp.q_sample(x0, t, noise), t, y), noise)
+            # per image, then mean: same gradient as mse_loss, but the split by t
+            # survives instead of being pooled away
+            eps = net(fp.q_sample(x0, t, noise), t, y)
+            se = (eps - noise).pow(2).flatten(1).mean(1)
+            loss = se.mean()
             opt.zero_grad()
             loss.backward()
             opt.step()
-            total += loss.item()
+            by_t.update(t, se)
         train_s = time.time() - start
 
         net.eval()
@@ -131,8 +145,10 @@ def main(
             value_range=(-1, 1),
         )
         log(
-            f"epoch {epoch}  loss {total / len(loader):.4f}  train {train_s:.0f}s  "
-            f"sample {time.time() - start:.0f}s  range [{x.min():.2f}, {x.max():.2f}]"
+            f"epoch {epoch}  loss {by_t.pooled():.4f}  train {train_s:.0f}s  "
+            f"sample {time.time() - start:.0f}s  range [{x.min():.2f}, {x.max():.2f}]\n"
+            + "  by t:     "
+            + cols([f"{m:.4f}" for m in by_t.means()], labels)
         )
         # num_classes rides along; without it the net can't be rebuilt to load this
         torch.save(
@@ -172,6 +188,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=10,
         help="condition on the MNIST label; 0 trains unconditionally",
+    )
+    p.add_argument(
+        "--loss-buckets",
+        type=int,
+        default=10,
+        help="t buckets the epoch loss is reported in; 1 pools as before",
     )
     return p.parse_args()
 
