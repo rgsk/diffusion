@@ -5,6 +5,9 @@ weights learn eps(x,t,y) and eps(x,t,∅). Sampling scales the gap between them:
 
     eps = eps_∅ + w · (eps_y - eps_∅)
 
+y is a label or a caption -- `null_label` is whichever "nothing" the net was
+built with, and the arithmetic below does not care which.
+
 w=1 is the plain conditional model, w=0 the unconditional one, w>1 extrapolates
 past what the model itself believes. What that samples is not p(x|y) but a
 sharpened p(x)·p(y|x)^w -- diversity falls as w rises, by construction.
@@ -17,13 +20,19 @@ from unet import UNet
 
 
 def drop_labels(y: Tensor, p: float, null_label: int) -> Tensor:
-    """A fresh y with a fraction p of its entries replaced by the null token.
-    Per sample, redrawn every step -- every image is seen both ways over training."""
+    """A fresh y with a fraction p of its rows replaced by the null token. Per
+    sample, redrawn every step -- every image is seen both ways over training.
+
+    y is [B] labels or [B, L] tokens; the draw is over the batch dimension either
+    way. Drawing over `y.shape` would drop individual *words* from a caption, which
+    trains a net to inpaint missing words, not an unconditional one."""
     assert 0.0 <= p <= 1.0, p
     if p == 0.0:
         return y
-    mask = torch.rand(y.shape, device=y.device) < p
-    return torch.where(mask, torch.full_like(y, null_label), y)
+    mask = torch.rand(y.shape[0], device=y.device) < p
+    return torch.where(
+        mask.reshape(-1, *([1] * (y.ndim - 1))), torch.full_like(y, null_label), y
+    )
 
 
 class Guided(nn.Module):
@@ -33,7 +42,7 @@ class Guided(nn.Module):
 
     def __init__(self, net: UNet, y: Tensor, w: float = 1.0):
         super().__init__()
-        assert net.num_classes is not None, "guidance needs a conditional net"
+        assert net.null_label is not None, "guidance needs a conditional net"
         self.net, self.y, self.w = net, y, w
 
     def forward(self, x: Tensor, t: Tensor) -> Tensor:
@@ -77,6 +86,17 @@ if __name__ == "__main__":
     assert torch.equal(y, y0), "drop_labels must not edit its input in place"
     kept = drop_labels(y, 0.5, C)
     assert ((kept == y) | (kept == C)).all()  # only ever y or null, never a third
+
+    # 1b. a caption is dropped whole. Per-element masking gives a net trained to
+    #     fill in missing words, and the same measured 10% rate, and grids that
+    #     look fine -- it fails only as guidance that does nothing.
+    seq = torch.randint(1, C, (100_000, 7))
+    got = drop_labels(seq, 0.1, 0)
+    rows = (got == 0).all(1)
+    assert (rows == (got == 0).any(1)).all(), "a caption was dropped word by word"
+    print(f"caption dropout rate at p=0.1: {rows.double().mean().item():.4f}")
+    assert abs(rows.double().mean().item() - 0.1) < 0.005
+    assert torch.equal(got[~rows], seq[~rows])  # kept captions are untouched
 
     # 2. the endpoints are the two models the trick is built from
     with torch.no_grad():

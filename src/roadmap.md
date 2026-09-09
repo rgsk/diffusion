@@ -11,7 +11,8 @@ showed live in `results.md`.
 - `timestep_embedding.py` — sinusoidal `t -> [B, dim]`, block layout.
 - `resblock.py` — GroupNorm/SiLU/conv ×2, temb added in the middle, zero-init
   `conv2` so a fresh block is exactly its skip.
-- `unet.py` — 28→14→7, mults (1,2,2), 4.17M params. Zero-init output conv.
+- `unet.py` — 28→14→7, mults (1,2,2), 4.17M params (4.72M with cross-attention).
+  Zero-init output conv.
 - `sampler.py` — ancestral DDPM, `sigma="beta"|"posterior"`.
 - `ddim.py` — DDIM, `steps`/`eta`/`clip`. `eta=0` is deterministic; `eta=1` at
   full length reproduces DDPM's posterior variance, asserted against it.
@@ -57,32 +58,73 @@ showed live in `results.md`.
   fresh block is its own skip. `UNet(attention=True)` puts one in the 7x7
   bottleneck (`main.py --attention`). Measured in `results.md`: **no effect on
   MNIST** — the convs already reach the whole image by the bottleneck. Kept for
-  the cross-attention path it provides.
+  the cross-attention path it provides, which is where it earned its place.
 - `sample.py` — ask a trained run for digits: `python sample.py <run> --label 3
-  --n 16 --w 3`. Rebuilds the net from the checkpoint alone (num_classes,
-  attention, schedule), EMA weights by default, `--label -1` for one class per
-  row. Checkpoints now record `attention` too; older ones are read off their own
-  weights.
+  --n 16 --w 3`, or `--prompt "a red 3 in the top left"` for a captioned run.
+  Rebuilds the net from the checkpoint alone (num_classes, vocab_size, channels,
+  image size, attention, schedule), EMA weights by default, `--label -1` for one
+  class per row. Older checkpoints are read off their own weights.
 - `class_conditioning.ipynb` — probes against a trained checkpoint: label sweep
   at fixed `x_T`, the null row, right-vs-wrong label by `t`, conditional vs
   unconditional by `t`. Cell 1 is all imports and helpers; every probe below
   runs on its own.
+- `colored_mnist.py` — 32x32 RGB MNIST with a caption per image: colour, digit
+  and position drawn independently, and "a red 3 in the top left" written from
+  the attributes that drew it. A 26-word closed vocabulary with a reserved
+  `<null>` token (index 0, the caption analogue of the null label row) and a
+  separate `<pad>`, so a short caption is not accidentally a partly-unconditional
+  one. Attributes are a function of the MNIST index, so the set is identical
+  every epoch and the held-out filter can run without loading an image.
+  `HELDOUT` drops six colour x digit pairs — one per colour, six distinct digits,
+  10% of the data — leaving every word trained and six combinations unseen.
+  `read_color`/`read_position` recover the attributes from pixels, and are
+  checked against the dataset that wrote them.
+- **cross-attention through the U-Net** — `UNet(vocab_size=...)` embeds tokens
+  into a context sequence and reads it with an `Attention(context_dim=...)` after
+  every ResBlock and in the bottleneck. Deliberately *not* added to `temb`: the
+  claim under test is that a pooled vector cannot bind an attribute to an
+  object, so the caption's only route to a pixel is attention — asserted by
+  zeroing the attention output projections on a trained net and watching the
+  caption go inert. (That claim did not survive its control run on
+  single-object images; see `results.md` and item 1 below.) `y` is `[B]` labels or `[B, L]` tokens, so `Conditioned`, `Guided` and
+  both samplers are unchanged. `drop_labels` now drops whole captions rather than
+  individual words. State dict keys are untouched when `vocab_size` is None, so
+  every earlier checkpoint still loads.
+- `main.py --dataset colored` — trains the captioned net; the per-epoch grid is
+  every colour x every digit, so the held-out cells are in the picture from
+  epoch 1.
+- `compositional.py` — the held-out eval. Generates every colour x digit pair,
+  scores colour and position off the pixels and the digit with a small CNN judge
+  trained on the *full* dataset (a judge that never saw a red 3 cannot grade
+  one), and reports seen-vs-held-out. The seen column is the control for judge
+  error. When a held-out pair fails it also reports which word was dropped —
+  kept the colour and got the digit wrong, or the reverse — which is what
+  separates recombining factors from recalling pairs.
+- `UNet(pooled=True)` / `main.py --pooled-context` — the control the item above
+  needed: the same tokens meaned into one vector and added to `temb`, the way a
+  class label is, with no attention anywhere. Measured in `results.md`:
+  **compositional generalization is complete (held-out 0.990 vs seen 0.993) and
+  cross-attention is not what produced it** — the pooled net matches it while
+  being provably a bag of words (shuffling the caption changes its output by
+  exactly 0.00000). One object per image means there is nothing to mis-bind, so
+  the dataset never creates the ambiguity cross-attention exists to resolve. The
+  eps-MSE and the per-epoch grids are both blind to the distinction; only the
+  control run separated the mechanisms, by showing they are the same here.
 
 ## Next
 
-Ordered. (1) is the last piece of the mechanism by which a model is told what to
-make. (2) is the formulation today's models use instead of the one implemented
-above.
+Ordered. (1) is unfinished business: the compositionality item above built the
+mechanism and then failed to find a task that needs it.
 
-1. **Colored digits on 32×32 with synthetic captions** — "a red 3 in the top
-   left". Adding a pooled vector to `temb` is enough for 10 classes and fails
-   for sentences, because binding an attribute to an object needs
-   cross-attention. `attention.py` has the block; threading a context through
-   `UNet` is part of this item. Hold out some colour×digit combinations from
-   training and check whether they can be generated: a real compositionality
-   test at MNIST cost. Real text-to-image adds a captioned dataset, a frozen text encoder,
-   and a VAE for latent diffusion — four new systems and a training run too
-   expensive to iterate on. This teaches the same lesson in minutes.
+1. **Two digits per image** — "a red 3 in the top left and a blue 7 in the
+   bottom right". `pooled_2026-09-09_21-26-36` showed that one object per image
+   cannot distinguish cross-attention from a bag of words, because a bag is
+   unambiguous when there is only one slot to empty it into. Two objects is the
+   smallest change that makes {red, 3, blue, 7} genuinely ambiguous, and it is
+   the setting the "red cube and blue sphere" failure actually lives in. The
+   dataset, the caption template and the eval all extend rather than change:
+   score each object separately and add a swapped-attribute failure mode. The
+   two runs already trained are the control.
 
 2. **Flow matching / rectified flow** — DDPM/DDIM is the SD1/SD2-era
    formulation; SD3 and Flux use a straight-line path from noise to data,

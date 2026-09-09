@@ -30,9 +30,17 @@ class Upsample(nn.Module):
 
 
 class UNet(nn.Module):
-    """Predicts eps from (x_t, t), and from a class label when num_classes is set.
-    Output conv is zero-init, so a fresh net predicts exactly zero noise and the
-    MSE loss starts at E[eps²] = 1."""
+    """Predicts eps from (x_t, t), and from conditioning: a class label when
+    `num_classes` is set, or a caption when `vocab_size` is (`pooled=True` for
+    the pooled-into-temb baseline instead). Output conv is
+    zero-init, so a fresh net predicts exactly zero noise and the MSE loss starts
+    at E[eps²] = 1.
+
+    The two conditioning paths are deliberately different. A label is one vector
+    added to `temb`, which reaches every pixel identically. A caption is a
+    sequence read by cross-attention after every ResBlock, and never touches
+    `temb` at all -- so nothing about a caption is pooled before the net sees it,
+    and each position picks out the words that concern it."""
 
     def __init__(
         self,
@@ -44,10 +52,18 @@ class UNet(nn.Module):
         groups: int = 8,
         num_classes: int | None = None,
         attention: bool = False,
+        vocab_size: int | None = None,
+        context_dim: int = 128,
+        cross_heads: int = 4,
+        max_tokens: int = 32,
+        null_token: int = 0,
+        pooled: bool = False,
     ):
         super().__init__()
         self.base, self.mults = base, mults
-        self.num_classes = num_classes
+        self.num_classes, self.vocab_size = num_classes, vocab_size
+        assert not (num_classes and vocab_size), "labels or captions, not both"
+        self.null_label = None  # the reserved "no conditioning" id, for CFG
         self.time_mlp = nn.Sequential(
             nn.Linear(base, time_dim), nn.SiLU(), nn.Linear(time_dim, time_dim)
         )
@@ -57,6 +73,25 @@ class UNet(nn.Module):
             # training rather than retrofitting it after.
             self.null_label = num_classes
             self.label_emb = nn.Embedding(num_classes + 1, time_dim)
+        if vocab_size is not None:
+            # index 0 by convention (see colored_mnist.VOCAB): an all-null
+            # sequence is the unconditional prompt, so the weights must have seen
+            # it during training just like the null label row.
+            assert 0 <= null_token < vocab_size, (null_token, vocab_size)
+            self.null_label = null_token
+            self.token_emb = nn.Embedding(vocab_size, context_dim)
+            # zero-init, so the sequence starts as a pure bag of words and any
+            # order-dependence the net acquires is learned rather than assumed
+            self.token_pos = nn.Parameter(torch.zeros(1, max_tokens, context_dim))
+            # the baseline this item exists to beat: mean the sequence into one
+            # vector and add it to temb, exactly as a class label is added. Every
+            # word still reaches the net; nothing records which word goes with
+            # which object.
+            self.pooled = pooled
+            if pooled:
+                self.context_pool = nn.Linear(context_dim, time_dim)
+        cross_on = vocab_size is not None and not pooled
+        cross = {"heads": cross_heads, "groups": groups, "context_dim": context_dim}
         self.conv_in = nn.Conv2d(in_ch, base, 3, padding=1)
 
         ch, skip_chs = base, [base]  # channel counts the up path will concat back
@@ -65,6 +100,8 @@ class UNet(nn.Module):
             for _ in range(num_res_blocks):
                 self.down.append(ResBlock(ch, base * m, time_dim, groups))
                 ch = base * m
+                if cross_on:
+                    self.down.append(Attention(ch, **cross))
                 skip_chs.append(ch)
             if i < len(mults) - 1:
                 self.down.append(Downsample(ch))
@@ -74,6 +111,7 @@ class UNet(nn.Module):
         # bottleneck only: at 28x28 self-attention is 784² pairs per head, and the
         # 7x7 bottleneck already carries what the whole image contributed
         self.mid_attn = Attention(ch, groups=groups) if attention else None
+        self.mid_cross = Attention(ch, **cross) if cross_on else None
         self.mid2 = ResBlock(ch, ch, time_dim, groups)
 
         self.up = nn.ModuleList()
@@ -83,6 +121,8 @@ class UNet(nn.Module):
                     ResBlock(ch + skip_chs.pop(), base * m, time_dim, groups)
                 )
                 ch = base * m
+                if cross_on:
+                    self.up.append(Attention(ch, **cross))
             if i > 0:
                 self.up.append(Upsample(ch))
         assert not skip_chs, skip_chs
@@ -94,10 +134,26 @@ class UNet(nn.Module):
         nn.init.zeros_(self.out_conv.bias)
 
     def forward(self, x: Tensor, t: Tensor, y: Tensor | None = None) -> Tensor:
+        """y is [B] class labels, or [B, L] token ids -- whichever this net was
+        built for. Same argument either way, so `Conditioned` and `Guided` and the
+        samplers behind them do not care which."""
         d = 2 ** (len(self.mults) - 1)
         assert x.shape[-1] % d == 0 and x.shape[-2] % d == 0, f"H,W must divide {d}"
         temb = self.time_mlp(timestep_embedding(t, self.base))
-        if self.num_classes is None:
+        context = None
+        if self.vocab_size is not None:
+            assert y is not None, "captioned net needs tokens (net.null_label for none)"
+            assert y.ndim == 2 and y.shape[0] == t.shape[0], (y.shape, t.shape)
+            assert y.shape[1] <= self.token_pos.shape[1], (
+                y.shape,
+                self.token_pos.shape,
+            )
+            assert 0 <= int(y.min()) and int(y.max()) < self.vocab_size, y
+            context = self.token_emb(y) + self.token_pos[:, : y.shape[1]]
+            if self.pooled:
+                temb = temb + self.context_pool(context.mean(1))
+                context = None  # nothing downstream reads it; there is no reader
+        elif self.num_classes is None:
             assert y is None, "unconditional net was handed a label"
         else:
             # silently dropping y would train an unconditional model that looks fine
@@ -108,14 +164,23 @@ class UNet(nn.Module):
         h = self.conv_in(x)
         hs = [h]
         for m in self.down:
-            h = m(h, temb) if isinstance(m, ResBlock) else m(h)
-            hs.append(h)
+            if isinstance(m, Attention):
+                # refines the block it follows rather than being a stage of its
+                # own, so it overwrites that skip instead of pushing a new one
+                h = hs[-1] = m(h, context)
+            else:
+                h = m(h, temb) if isinstance(m, ResBlock) else m(h)
+                hs.append(h)
         h = self.mid1(h, temb)
         if self.mid_attn is not None:
             h = self.mid_attn(h)
+        if self.mid_cross is not None:
+            h = self.mid_cross(h, context)
         h = self.mid2(h, temb)
         for m in self.up:
-            if isinstance(m, ResBlock):
+            if isinstance(m, Attention):
+                h = m(h, context)
+            elif isinstance(m, ResBlock):
                 h = m(torch.cat([h, hs.pop()], dim=1), temb)
             else:
                 h = m(h)
@@ -267,5 +332,132 @@ if __name__ == "__main__":
     right, wrong = right / 200, wrong / 200
     print(f"eps-MSE  right label {right:.4f}   wrong label {wrong:.4f}")
     assert wrong > right * 2  # a net ignoring y scores these identically (obs. 4x)
+
+    # 9. caption conditioning. Same y argument, a sequence instead of a scalar,
+    #    and every way of getting that wrong is a net that trains to a plausible
+    #    loss while ignoring most of what it was told
+    from colored_mnist import SEQ_LEN, VOCAB, ColoredMNIST, caption, decode, encode
+
+    V = len(VOCAB)
+    tnet = UNet(in_ch=3, vocab_size=V)
+    xt3 = torch.randn(B, 3, 32, 32)
+    toks = torch.randint(0, V, (B, SEQ_LEN))
+    assert tnet.num_classes is None and tnet.null_label == 0
+    assert tnet(xt3, tc, toks).shape == xt3.shape
+    assert torch.equal(tnet(xt3, tc, toks), torch.zeros_like(xt3))  # zero-init holds
+    # L is free: that is the whole reason KV comes from tokens and not from pixels
+    for lengths in (3, 7, 12):
+        assert tnet(xt3, tc, toks[:, :1].repeat(1, lengths)).shape == xt3.shape
+    for bad in (
+        lambda: tnet(xt3, tc),  # captioned net handed no tokens
+        lambda: tnet(xt3, tc, toks[0]),  # [L] instead of [B, L]
+        lambda: tnet(xt3, tc, toks[:2]),  # not batched alongside t
+        lambda: tnet(xt3, tc, toks + V),  # past the vocabulary
+        lambda: tnet(xt3, tc, toks.repeat(1, 8)),  # longer than max_tokens
+        lambda: UNet(in_ch=3, num_classes=10)(xt3, tc, toks),  # tokens to a label net
+        lambda: UNet(in_ch=3, vocab_size=V, num_classes=10),  # both at once
+    ):
+        try:
+            bad()
+            raise SystemExit("guard missing")
+        except AssertionError:
+            pass
+
+    # 10. THE property: the caption carries information, and it carries it word by
+    #     word. Overfit six captioned images, then re-score the same x_t with a
+    #     caption differing in exactly one token. A net that pools the sequence
+    #     and adds it to temb would still pass "wrong caption is worse"; it is
+    #     changing *one word* that separates binding from a bag of concepts.
+    #     Six images of the same digit at the same position, one per colour, so
+    #     the colour word is the *only* thing telling them apart. Pick six
+    #     different digits instead and the digit token alone identifies each
+    #     image, the net can ignore colour entirely, and this test passes
+    #     vacuously (measured: 1.2x, against 3x here).
+    cds = ColoredMNIST()
+    picks, want = [], []
+    for k in range(len(cds)):
+        img, tok = cds[k]
+        words = decode(tok).split()  # decode drops <pad>; joining raw ids keeps it
+        col, dig, pos = words[1], words[2], " ".join(words[5:])
+        # digit 4 is in no held-out pair, so all six colours of it exist in train
+        if dig != "4" or pos != "center" or col in want:
+            continue
+        picks.append((img, tok))
+        want.append(col)
+        if len(picks) == 6:
+            break
+    assert len(picks) == 6, want
+    x0c = torch.stack([p[0] for p in picks]).to(dev)
+    yc2 = torch.stack([p[1] for p in picks]).to(dev)
+    tnet = UNet(in_ch=3, vocab_size=V).to(dev)
+    print(f"captioned params: {sum(p.numel() for p in tnet.parameters()) / 1e6:.2f}M")
+    opt = torch.optim.Adam(tnet.parameters(), lr=3e-4)
+    for step in range(2001):  # 800 leaves the margins below at ~2x, too thin to trust
+        ti = fp.sample_t(len(picks), dev)
+        noise = torch.randn_like(x0c)
+        loss = F.mse_loss(tnet(fp.q_sample(x0c, ti, noise), ti, yc2), noise)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        if step % 500 == 0:
+            print(f"  step {step:3d}  loss {loss.item():.4f}")
+
+    # one token changed: the colour word, and nothing else
+    swapped = yc2.clone()
+    swapped[:, 1] = yc2.roll(1, 0)[:, 1]
+    nulled = torch.zeros_like(yc2)  # the unconditional prompt
+    scores = dict.fromkeys(("right", "colour swapped", "null"), 0.0)
+    torch.manual_seed(0)
+    with torch.no_grad():
+        for _ in range(200):  # one draw of (t, eps) is far too noisy to compare
+            ti = fp.sample_t(len(picks), dev)
+            noise = torch.randn_like(x0c)
+            xt = fp.q_sample(x0c, ti, noise)
+            for k, yy in zip(scores, (yc2, swapped, nulled)):
+                scores[k] += F.mse_loss(tnet(xt, ti, yy), noise).item() / 200
+    print("eps-MSE  " + "  ".join(f"{k} {v:.4f}" for k, v in scores.items()))
+    assert scores["colour swapped"] > scores["right"] * 2, scores
+    assert scores["null"] > scores["right"] * 2, scores
+
+    # 11. and the only route from caption to pixels is cross-attention. Zero the
+    #     attention output projections on the *trained* net and the caption goes
+    #     completely inert -- which it could not, if any of it were leaking
+    #     through temb the way a class label does
+    with torch.no_grad():
+        for m in tnet.modules():
+            if isinstance(m, Attention):
+                nn.init.zeros_(m.proj.weight)
+                nn.init.zeros_(m.proj.bias)
+        ti = fp.sample_t(len(picks), dev)
+        xt = fp.q_sample(x0c, ti)
+        assert torch.equal(tnet(xt, ti, yc2), tnet(xt, ti, nulled))
+    assert caption("red", "3", "center") == "a red 3 in the center"
+    assert encode(caption("red", "3", "center")).shape == (SEQ_LEN,)
+
+    # 12. the pooled baseline: same tokens, meaned into one vector and added to
+    #     temb the way a class label is. Structurally it must be the *other*
+    #     thing -- no cross-attention anywhere -- or the comparison in results.md
+    #     is between a net and itself.
+    pnet = UNet(in_ch=3, vocab_size=V, pooled=True)
+    assert not any(isinstance(m, Attention) for m in pnet.modules())
+    assert pnet.mid_cross is None and pnet.null_label == 0
+    n_cross = sum(
+        isinstance(m, Attention) for m in UNet(in_ch=3, vocab_size=V).modules()
+    )
+    print(f"cross-attention blocks: {n_cross} vs pooled {0}")
+    assert n_cross == 10
+    with torch.no_grad():  # the zero-inits again, or every check below is 0 == 0
+        for m in pnet.modules():
+            if isinstance(m, ResBlock):
+                nn.init.normal_(m.conv2.weight, std=0.05)
+        nn.init.normal_(pnet.out_conv.weight, std=0.05)
+        a = pnet(xt3, tc, toks)
+        assert not torch.allclose(a, pnet(xt3, tc, torch.zeros_like(toks)))
+        # and it really is pooled: a permuted caption is the same bag of words,
+        # so it must give the same answer once token_pos is zero (which it is at
+        # init). This is exactly the property that cannot bind a word to a place.
+        assert torch.allclose(
+            a, pnet(xt3, tc, toks[:, torch.randperm(SEQ_LEN)]), atol=1e-5
+        )
 
     print("ok")

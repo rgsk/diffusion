@@ -333,3 +333,81 @@ So this block earns its place as **infrastructure, not quality**: the same class
 with `context_dim` set is cross-attention, which is the only mechanism that can
 bind "red" to "3" and "top left" to a position. That is the next item, and it is
 where this will be measured properly.
+
+## Captions and cross-attention — `caption_2026-09-09_20-18-28` vs `pooled_2026-09-09_21-26-36`
+
+Colored MNIST on a 32x32 canvas, captioned "a red 3 in the top left". Six
+colour x digit pairs held out of training (red 3, green 7, blue 1, yellow 5,
+cyan 9, magenta 0) — one per colour, six distinct digits, 10% of the images.
+Every word is trained; six combinations are never shown.
+
+30 epochs each, batch 64, `--seed 0`, cosine schedule, w=3 at sample time.
+Identical but for how the caption reaches the net:
+
+- **caption** — cross-attention. The caption stays a sequence of 7 word vectors,
+  read by an `Attention` block after every ResBlock and in the bottleneck. 4.72M
+  params, 72s/epoch.
+- **pooled** — the baseline. Same token embeddings, meaned into one vector and
+  added to `temb` exactly as a class label is. No attention anywhere. 4.21M
+  params, 53s/epoch.
+
+Scored by `compositional.py`: 960 samples, colour and position read off the
+pixels, digit read by a CNN judge trained on the full dataset including the
+held-out pairs (a judge that never saw a red 3 cannot grade one).
+
+| | colour | digit | position | all three |
+| --- | --- | --- | --- | --- |
+| cross-attention, seen (54 pairs) | 1.000 | 0.993 | 1.000 | 0.993 |
+| cross-attention, held out (6) | 1.000 | 0.990 | 1.000 | 0.990 |
+| pooled, seen (54 pairs) | 1.000 | 1.000 | 1.000 | 1.000 |
+| pooled, held out (6) | 1.000 | 0.990 | 1.000 | 0.990 |
+
+**Compositional generalization is real and complete.** Both nets draw red 3s
+they were never shown, in the right colour, at all five positions. Held-out
+scores sit inside the seen scores' noise — one miss in 96 samples for each, and
+in both cases the model kept the colour and drew a neighbouring digit. Colour
+and digit are learned as separate factors, not memorised as pairs.
+
+**And cross-attention was not needed for any of it.** That is the finding, and
+it contradicts the reason this item was written. The pooled net matches it on
+every column while being provably a bag of words: swapping "red" and "top" in
+the token sequence changes its eps prediction by exactly 0.00000, against 0.024
+for the cross-attention net. It cannot tell "a red 3 in the top left" from "a
+top 3 in the red left", and it does not need to.
+
+Why the test does not bite: **there is one object in the image**. Binding
+failure requires two things competing for attributes — the "red cube and blue
+sphere" that returns a blue cube. With a single digit on the canvas, the bag
+{red, 3, top-left} is unambiguous, because there is only one slot to put it in.
+Cross-attention resolves an ambiguity this dataset never creates.
+
+The eps-MSE never hinted at any of it. Final `by t` rows are the same to three
+decimals at every bucket:
+
+| t | cross-attention | pooled |
+| --- | --- | --- |
+| 0-99 | 0.0191 | 0.0187 |
+| 300-399 | 0.0050 | 0.0051 |
+| 600-699 | 0.0028 | 0.0028 |
+| 900-999 | 0.0003 | 0.0003 |
+| pooled scalar | 0.0053 | 0.0052 |
+
+Which is the second lesson: the training loss cannot see this question at all.
+Neither can the per-epoch grid — both look correct — and neither, it turns out,
+can a held-out-combination eval on single-object images. The control run is the
+only thing that separated the two mechanisms, and it separated them by showing
+they are the same here.
+
+Caveats. The pooled net has 12% fewer parameters, since removing attention
+removes weights — irrelevant to a null result, but it would have been a
+competing explanation had pooled lost. The judge reads real MNIST test digits at
+0.968 and generated ones at ~0.99, because w=3 sharpens samples toward cleaner
+prototypes than real handwriting; so 0.990 is agreement with an imperfect ruler,
+and only the seen-vs-held-out *gap* is trustworthy. Both columns pass through
+the same ruler, so the gap is.
+
+What would actually test binding: **two digits per image**, "a red 3 in the top
+left and a blue 7 in the bottom right". Then the pooled vector carries {red, 3,
+blue, 7, top-left, bottom-right} with no record of which colour goes with which
+digit, and the sum genuinely cannot represent the answer. That is the next item,
+and this run is the control it needs.

@@ -1,4 +1,7 @@
-"""Sample digits from a trained run: pick a label, pick a guidance scale, get a PNG.
+"""Sample from a trained run: pick a label or write a prompt, get a PNG.
+
+    python sample.py <run> --label 3 --n 16 --w 3
+    python sample.py <run> --prompt "a red 3 in the top left" --n 16
 
 Everything else in this project samples inside the training loop. This is the
 same machinery with a CLI in front of it.
@@ -11,6 +14,7 @@ import torch
 from torchvision.utils import save_image
 
 from cfg import Guided
+from colored_mnist import SEQ_LEN, encode, prompt_grid
 from ddim import DDIMSampler
 from forward_process import ForwardProcess
 from sampler import DDPMSampler
@@ -33,16 +37,29 @@ def load(run: str, device: str, weights: str = "ema"):
     attention = ck.get("attention", any(k.startswith("mid_attn") for k in state))
     # the oldest runs predate conditioning entirely and have no such key either
     C = ck.get("num_classes") or None
-    net = UNet(num_classes=C, attention=attention)
+    V = ck.get("vocab_size") or None
+    net = UNet(
+        in_ch=ck.get("in_ch", 1),
+        num_classes=C,
+        attention=attention,
+        vocab_size=V,
+        pooled=ck.get("pooled", False),
+    )
     net.load_state_dict(state)
     fp = ForwardProcess()
     fp.load_state_dict(ck["fp"])  # schedule buffers, whichever schedule it was
-    return net.to(device).eval(), fp.to(device), C
+    shape = (ck.get("in_ch", 1), ck.get("image_size", 28), ck.get("image_size", 28))
+    return net.to(device).eval(), fp.to(device), shape
+
+
+def slug(text: str) -> str:
+    return "".join(c if c.isalnum() else "_" for c in text)
 
 
 def main(
     run: str,
     label: int = -1,
+    prompt: str = "",
     n: int = 16,
     w: float = 3.0,
     steps: int = 50,
@@ -52,35 +69,44 @@ def main(
     out: str = "",
 ):
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    net, fp, C = load(run, dev, weights)
+    net, fp, shape = load(run, dev, weights)
+    C, V = net.num_classes, net.vocab_size
     smp = DDPMSampler(fp) if sampler == "ddpm" else DDIMSampler(fp, steps=steps)
     smp = smp.to(dev)
     if seed is not None:
         torch.manual_seed(seed)
 
-    if C is None:
-        assert label < 0, f"{run} is unconditional -- it has no labels to ask for"
-        model, nrow = net, min(n, 8)
+    if V is not None:
+        assert label < 0, f"{run} is captioned -- ask it with --prompt, not --label"
+        if prompt:
+            # encode() raises on an unknown word rather than encoding a shrug
+            y = encode(prompt).to(dev).expand(n, SEQ_LEN)
+            nrow, tag = min(n, 8), slug(prompt)
+        else:
+            y, nrow, _ = prompt_grid(dev)  # every colour x every digit
+            tag = "grid"
+        model = Guided(net, y, w)
+    elif C is None:
+        assert label < 0 and not prompt, f"{run} is unconditional -- nothing to ask"
+        model, y, nrow, tag = net, torch.empty(n), min(n, 8), "uncond"
     else:
+        assert not prompt, f"{run} is class-conditioned -- use --label, not --prompt"
         assert -1 <= label < C, f"label must be 0..{C - 1}, or -1 for all classes"
         if label < 0:
             per = max(1, n // C)  # one class per row, every class
             y = torch.arange(C, device=dev).repeat_interleave(per)
-            nrow = per
+            nrow, tag = per, "all"
         else:
             y = torch.full((n,), label, device=dev)
-            nrow = min(n, 8)
+            nrow, tag = min(n, 8), str(label)
         model = Guided(net, y, w)
 
-    total = n if C is None or label >= 0 else y.shape[0]
-    x = smp.sample(model, (total, 1, 28, 28), dev)
+    total = y.shape[0]
+    x = smp.sample(model, (total, *shape), dev)
     path = (
         Path(out)
         if out
-        else repo_root()
-        / "artifacts"
-        / run
-        / (f"sample_{'all' if label < 0 else label}_w{w:g}.png")
+        else repo_root() / "artifacts" / run / f"sample_{tag}_w{w:g}.png"
     )
     save_image(x.cpu(), path, nrow=nrow, normalize=True, value_range=(-1, 1))
     print(f"{total} images -> {path}   range [{x.min():.2f}, {x.max():.2f}]")
@@ -93,6 +119,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("run", help="folder under artifacts/, e.g. cfg_2026-09-09_18-17-27")
     p.add_argument(
         "--label", type=int, default=-1, help="digit to draw; -1 = all classes"
+    )
+    p.add_argument(
+        "--prompt",
+        default="",
+        help='caption for a captioned run, e.g. "a red 3 in the top left"; '
+        "omit for the full colour x digit grid",
     )
     p.add_argument(
         "--n", type=int, default=16, help="images (split across classes if -1)"
