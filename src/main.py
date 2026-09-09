@@ -14,7 +14,7 @@ from torchvision.utils import save_image
 from ddim import DDIMSampler
 from forward_process import ForwardProcess
 from sampler import DDPMSampler
-from unet import UNet
+from unet import Conditioned, UNet
 from utils import repo_root
 
 
@@ -63,6 +63,7 @@ def main(
     name: str = "scratch",
     sampler: str = "ddim",
     ddim_steps: int = 50,
+    num_classes: int = 10,
 ):
     root = repo_root()
     out = run_dir(name)
@@ -81,25 +82,36 @@ def main(
     )
 
     fp = ForwardProcess().to(dev)
-    net = UNet().to(dev)
+    net = UNet(num_classes=num_classes or None).to(dev)
     smp = build_sampler(fp, sampler, ddim_steps).to(dev)
     opt = torch.optim.Adam(net.parameters(), lr=lr)
     log(
         f"out {out}\n"
         f"epochs {epochs}  batch {batch_size}  lr {lr}  n_samples {n_samples}\n"
         f"sampler {sampler}  {getattr(smp, 'steps', fp.T)} steps\n"
+        f"classes {num_classes or 'unconditional'}\n"
         f"device {dev}  params {sum(p.numel() for p in net.parameters()) / 1e6:.2f}M  "
         f"{len(loader)} steps/epoch"
     )
 
+    if num_classes:
+        per_class = max(1, n_samples // num_classes)
+        y_grid = torch.arange(num_classes, device=dev).repeat_interleave(per_class)
+        # save_image's nrow is images *per* row, i.e. a column count. Handing it
+        # per_class against a label-major y_grid puts one class on each row.
+        nrow = per_class
+    else:
+        y_grid, nrow = None, 8
+
     for epoch in range(1, epochs + 1):
         net.train()
         start, total = time.time(), 0.0
-        for x0, _ in loader:
+        for x0, y in loader:
             x0 = x0.to(dev)
+            y = y.to(dev) if num_classes else None
             t = fp.sample_t(x0.shape[0], dev)
             noise = torch.randn_like(x0)
-            loss = F.mse_loss(net(fp.q_sample(x0, t, noise), t), noise)
+            loss = F.mse_loss(net(fp.q_sample(x0, t, noise), t, y), noise)
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -108,11 +120,13 @@ def main(
 
         net.eval()
         start = time.time()
-        x = smp.sample(net, (n_samples, 1, 28, 28), dev)
+        model = net if y_grid is None else Conditioned(net, y_grid)
+        n = n_samples if y_grid is None else y_grid.shape[0]
+        x = smp.sample(model, (n, 1, 28, 28), dev)
         save_image(
             x.cpu(),
             out / f"samples_epoch{epoch:02d}.png",
-            nrow=8,
+            nrow=nrow,
             normalize=True,
             value_range=(-1, 1),
         )
@@ -120,7 +134,15 @@ def main(
             f"epoch {epoch}  loss {total / len(loader):.4f}  train {train_s:.0f}s  "
             f"sample {time.time() - start:.0f}s  range [{x.min():.2f}, {x.max():.2f}]"
         )
-        torch.save({"net": net.state_dict(), "fp": fp.state_dict()}, out / "ckpt.pt")
+        # num_classes rides along; without it the net can't be rebuilt to load this
+        torch.save(
+            {
+                "net": net.state_dict(),
+                "fp": fp.state_dict(),
+                "num_classes": num_classes,
+            },
+            out / "ckpt.pt",
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -145,6 +167,12 @@ def parse_args() -> argparse.Namespace:
         help="sampler for the per-epoch grid",
     )
     p.add_argument("--ddim-steps", type=int, default=50, help="ignored for ddpm")
+    p.add_argument(
+        "--num-classes",
+        type=int,
+        default=10,
+        help="condition on the MNIST label; 0 trains unconditionally",
+    )
     return p.parse_args()
 
 
