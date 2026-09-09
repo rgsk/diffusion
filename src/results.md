@@ -156,3 +156,37 @@ errors were being computed and thrown away.
 
 Printed epoch loss is unchanged in meaning — it is the count-weighted pooled
 mean, identical to the old `F.mse_loss` average.
+
+## EMA of weights — `ema_2026-09-09_17-21-32`
+
+5 epochs, conditional, decay 0.999 with the `(1+n)/(10+n)` warm-up ramp. The
+shadow copy costs one extra 4.17M-param buffer and a multiply-add per step;
+epoch time is unchanged at 48s.
+
+Held-out eps-MSE, 16k paired draws (same `t` and same noise for both nets), the
+trained weights against their own EMA:
+
+| t | trained | ema | ratio |
+| --- | --- | --- | --- |
+| 0-99 | 0.09357 | 0.09150 | 1.02x |
+| 300-399 | 0.02376 | 0.02249 | 1.06x |
+| 600-699 | 0.00313 | 0.00292 | 1.07x |
+| 800-899 | 0.00039 | 0.00032 | 1.23x |
+| 900-999 | 0.00025 | 0.00020 | 1.28x |
+| pooled | 0.02277 | 0.02201 | 1.03x |
+
+EMA wins in every bucket, and **the win grows with `t`**: 2% at the bottom, 28%
+at the top. Same asymmetry as the label's, and for a related reason — high `t`
+is where the target is nearly the input, so what remains to lose there is
+largely gradient noise, which is exactly what averaging removes.
+
+Note what the pooled number does to this: 1.03x. A 28% improvement in the region
+the sampler starts from is reported as 3%, because low `t` dominates the
+average. Without the bucketed log this would have read as noise.
+
+Visually, at 5 epochs on MNIST the two grids (`compare_trained.png`,
+`compare_ema.png`, same `x_T`) are both clean and the difference is not
+convincing by eye — a few digits differ in identity, neither set is obviously
+better. Across-sample std 0.3877 trained vs 0.3707 EMA. The measurable claim
+here is the held-out loss; the visible-quality claim from the literature is for
+longer runs and harder data than this.

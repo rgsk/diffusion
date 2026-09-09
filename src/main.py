@@ -3,6 +3,7 @@
 import argparse
 import shutil
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -11,6 +12,7 @@ from torchvision import datasets, transforms
 from torchvision.utils import save_image
 
 from ddim import DDIMSampler
+from ema import EMA
 from forward_process import ForwardProcess
 from loss_by_t import LossByT
 from sampler import DDPMSampler
@@ -71,6 +73,7 @@ def main(
     ddim_steps: int = 50,
     num_classes: int = 10,
     loss_buckets: int = 10,
+    ema_decay: float = 0.999,
 ):
     root = repo_root()
     out = run_dir(name)
@@ -92,12 +95,14 @@ def main(
     net = UNet(num_classes=num_classes or None).to(dev)
     smp = build_sampler(fp, sampler, ddim_steps).to(dev)
     opt = torch.optim.Adam(net.parameters(), lr=lr)
+    ema = EMA(net, ema_decay) if ema_decay else None
     labels = LossByT(fp.T, loss_buckets).labels
     log(
         f"out {out}\n"
         f"epochs {epochs}  batch {batch_size}  lr {lr}  n_samples {n_samples}\n"
         f"sampler {sampler}  {getattr(smp, 'steps', fp.T)} steps\n"
-        f"classes {num_classes or 'unconditional'}\n"
+        f"classes {num_classes or 'unconditional'}  "
+        f"ema {ema_decay or 'off'}\n"
         f"device {dev}  params {sum(p.numel() for p in net.parameters()) / 1e6:.2f}M  "
         f"{len(loader)} steps/epoch\n"
         f"loss by t:  {cols(labels, labels)}"
@@ -130,13 +135,18 @@ def main(
             loss.backward()
             opt.step()
             by_t.update(t, se)
+            if ema:
+                ema.update(net)
         train_s = time.time() - start
 
         net.eval()
         start = time.time()
-        model = net if y_grid is None else Conditioned(net, y_grid)
         n = n_samples if y_grid is None else y_grid.shape[0]
-        x = smp.sample(model, (n, 1, 28, 28), dev)
+        # the grid is what the run is judged on, so draw it from the weights that
+        # would actually ship -- the averaged ones
+        with ema.as_weights(net) if ema else nullcontext():
+            model = net if y_grid is None else Conditioned(net, y_grid)
+            x = smp.sample(model, (n, 1, 28, 28), dev)
         save_image(
             x.cpu(),
             out / f"samples_epoch{epoch:02d}.png",
@@ -154,6 +164,7 @@ def main(
         torch.save(
             {
                 "net": net.state_dict(),
+                "ema": ema.shadow if ema else None,  # None so a loader can tell
                 "fp": fp.state_dict(),
                 "num_classes": num_classes,
             },
@@ -194,6 +205,13 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=10,
         help="t buckets the epoch loss is reported in; 1 pools as before",
+    )
+    p.add_argument(
+        "--ema-decay",
+        type=float,
+        default=0.999,
+        help="weight EMA for the sampled grid and the 'ema' checkpoint key; "
+        "0 disables and samples from the trained weights",
     )
     return p.parse_args()
 

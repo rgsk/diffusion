@@ -28,6 +28,12 @@ showed live in `results.md`.
   training draws themselves, no extra forward passes. `main.py` prints a row
   under a header of ranges each epoch (`--loss-buckets`, default 10); the epoch
   scalar is now the accumulator's count-weighted pooled mean.
+- `ema.py` — `EMA`, a shadow copy of the weights trailing the trained ones
+  (`min(decay, (1+n)/(10+n))` ramp so early epochs are not an average with the
+  random init), plus an `as_weights` context manager that swaps them in for
+  sampling and restores exactly. A pure observer: the training path is
+  unchanged. `main.py` updates it per step, draws the epoch grid under it, and
+  saves it beside `net` in the checkpoint. `--ema-decay 0` disables.
 - `class_conditioning.ipynb` — probes against a trained checkpoint: label sweep
   at fixed `x_T`, the null row, right-vs-wrong label by `t`, conditional vs
   unconditional by `t`. Cell 1 is all imports and helpers; every probe below
@@ -35,14 +41,13 @@ showed live in `results.md`.
 
 ## Next
 
-Ordered. (1)-(2) are knobs, an afternoon each. (3)-(5) are the rest of the
-mechanism by which a model is told what to make. (6) is the formulation today's
-models use instead of the one implemented above.
+Ordered. (1) is a knob, an afternoon. (2)-(4) are the rest of the mechanism by
+which a model is told what to make. (5) is the formulation today's models use
+instead of the one implemented above.
 
-1. **EMA of weights** — standard in DDPM, usually a visible quality win.
-2. **Cosine schedule** — linear betas destroy MNIST's signal early.
+1. **Cosine schedule** — linear betas destroy MNIST's signal early.
 
-3. **Classifier-free guidance** — the engine of every conditional model. Drop
+2. **Classifier-free guidance** — the engine of every conditional model. Drop
    the label to a null token with p≈0.1 during training, so one net learns both
    `eps(x_t, t, y)` and `eps(x_t, t, ∅)`; at sample time
    `eps = eps_uncond + w * (eps_cond - eps_uncond)`. Sweep `w` and watch: 0 is
@@ -51,10 +56,10 @@ models use instead of the one implemented above.
    sharpened `p(x)·p(y|x)^w`, so the diversity loss at high `w` is the
    mechanism, not a bug. `sampler.py`'s Gaussian oracle can measure exactly
    that: std shrinking as `w` rises.
-4. **Attention** — self-attention at 7×7, and cross-attention (image positions
+3. **Attention** — self-attention at 7×7, and cross-attention (image positions
    as queries, conditioning tokens as keys/values). Same block, different KV
-   source. Not a polish item: it is the prerequisite for (5).
-5. **Colored digits on 32×32 with synthetic captions** — "a red 3 in the top
+   source. Not a polish item: it is the prerequisite for (4).
+4. **Colored digits on 32×32 with synthetic captions** — "a red 3 in the top
    left". Adding a pooled vector to `temb` is enough for 10 classes and fails
    for sentences, because binding an attribute to an object needs
    cross-attention. Hold out some colour×digit combinations from training and
@@ -63,7 +68,7 @@ models use instead of the one implemented above.
    and a VAE for latent diffusion — four new systems and a training run too
    expensive to iterate on. This teaches the same lesson in minutes.
 
-6. **Flow matching / rectified flow** — DDPM/DDIM is the SD1/SD2-era
+5. **Flow matching / rectified flow** — DDPM/DDIM is the SD1/SD2-era
    formulation; SD3 and Flux use a straight-line path from noise to data,
    predicting velocity instead of eps. Simpler than what is already written —
    no beta schedule, no posterior-variance algebra — and it slots in beside
