@@ -79,6 +79,7 @@ def main(
     seed: int = 0,
     label_dropout: float = 0.1,
     guidance: float = 1.0,
+    attention: bool = False,
 ):
     root = repo_root()
     out = run_dir(name)
@@ -100,7 +101,7 @@ def main(
     )
 
     fp = ForwardProcess(schedule=schedule).to(dev)
-    net = UNet(num_classes=num_classes or None).to(dev)
+    net = UNet(num_classes=num_classes or None, attention=attention).to(dev)
     smp = build_sampler(fp, sampler, ddim_steps).to(dev)
     opt = torch.optim.Adam(net.parameters(), lr=lr)
     ema = EMA(net, ema_decay) if ema_decay else None
@@ -112,7 +113,8 @@ def main(
         f"schedule {schedule}\n"
         f"classes {num_classes or 'unconditional'}  "
         f"ema {ema_decay or 'off'}  "
-        f"label dropout {label_dropout}  guidance {guidance}\n"
+        f"label dropout {label_dropout}  guidance {guidance}  "
+        f"attention {attention}\n"
         f"seed {seed}\n"
         f"device {dev}  params {sum(p.numel() for p in net.parameters()) / 1e6:.2f}M  "
         f"{len(loader)} steps/epoch\n"
@@ -237,6 +239,11 @@ def parse_args() -> argparse.Namespace:
         help="beta schedule for the forward process",
     )
     p.add_argument("--seed", type=int, default=0, help="init, shuffling, and noise")
+    p.add_argument(
+        "--attention",
+        action="store_true",
+        help="self-attention in the 7x7 bottleneck",
+    )
     p.add_argument(
         "--label-dropout",
         type=float,

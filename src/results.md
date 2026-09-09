@@ -303,3 +303,33 @@ Reproduced in `cfg.ipynb`. Re-running moves the top of the accuracy curve by
 about half a point (w=2 read 0.995 once and 1.000 the next time) — cuDNN is
 nondeterministic, and `--seed` pairs runs without making them bitwise equal.
 Differences that small are not findings.
+
+## Self-attention in the bottleneck — `attn_off_2026-09-09_18-51-37` vs `attn_on_2026-09-09_18-58-11`
+
+8 epochs each, `--seed 0`, identical but for `--attention`. One `Attention` block
+between the two bottleneck ResBlocks: +66k params (4.173M → 4.239M), +1s/epoch.
+
+Held-out eps-MSE by `t` — same schedule and seed, so the buckets line up:
+
+| t | off | on | ratio |
+| --- | --- | --- | --- |
+| 0-99 | 0.10915 | 0.10898 | 1.002x |
+| 300-399 | 0.03746 | 0.03755 | 0.998x |
+| 600-699 | 0.02072 | 0.02079 | 0.997x |
+| 900-999 | 0.00171 | 0.00171 | 0.996x |
+| pooled | 0.03680 | 0.03680 | 1.000x |
+
+**No effect.** Every bucket is within 0.4%, and the pooled numbers are identical
+to five decimals. Label accuracy 0.920 off vs 0.935 on at w=1, which is inside
+the ±1 point this setup wobbles by; both are 1.000 at w=3.
+
+Expected, and worth stating plainly: at 28x28 with a 7x7 bottleneck, a stack of
+3x3 convs already has a receptive field covering the whole image by the time it
+reaches the middle. Attention's advantage is reach, and there is no reach left to
+buy. It pays on 64x64+ where the bottleneck is still large relative to the
+features that must agree.
+
+So this block earns its place as **infrastructure, not quality**: the same class
+with `context_dim` set is cross-attention, which is the only mechanism that can
+bind "red" to "3" and "top left" to a position. That is the next item, and it is
+where this will be measured properly.

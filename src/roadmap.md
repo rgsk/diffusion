@@ -52,6 +52,12 @@ showed live in `results.md`.
   w=1.5 costs 5% diversity for 99% label accuracy. `cfg.ipynb` sweeps it: the
   two curves, and the grids that show what the diversity number stops meaning
   past w≈8.
+- `attention.py` — `Attention(ch, heads, groups, context_dim=None)`: self when
+  `context_dim` is None, cross when it is set, zero-init output projection so a
+  fresh block is its own skip. `UNet(attention=True)` puts one in the 7x7
+  bottleneck (`main.py --attention`). Measured in `results.md`: **no effect on
+  MNIST** — the convs already reach the whole image by the bottleneck. Kept for
+  the cross-attention path it provides.
 - `class_conditioning.ipynb` — probes against a trained checkpoint: label sweep
   at fixed `x_T`, the null row, right-vs-wrong label by `t`, conditional vs
   unconditional by `t`. Cell 1 is all imports and helpers; every probe below
@@ -59,23 +65,21 @@ showed live in `results.md`.
 
 ## Next
 
-Ordered. (1)-(2) are the rest of the mechanism by which a model is told what to
-make. (3) is the formulation today's models use instead of the one implemented
+Ordered. (1) is the last piece of the mechanism by which a model is told what to
+make. (2) is the formulation today's models use instead of the one implemented
 above.
 
-1. **Attention** — self-attention at 7×7, and cross-attention (image positions
-   as queries, conditioning tokens as keys/values). Same block, different KV
-   source. Not a polish item: it is the prerequisite for (2).
-2. **Colored digits on 32×32 with synthetic captions** — "a red 3 in the top
+1. **Colored digits on 32×32 with synthetic captions** — "a red 3 in the top
    left". Adding a pooled vector to `temb` is enough for 10 classes and fails
    for sentences, because binding an attribute to an object needs
-   cross-attention. Hold out some colour×digit combinations from training and
-   check whether they can be generated: a real compositionality test at MNIST
-   cost. Real text-to-image adds a captioned dataset, a frozen text encoder,
+   cross-attention. `attention.py` has the block; threading a context through
+   `UNet` is part of this item. Hold out some colour×digit combinations from
+   training and check whether they can be generated: a real compositionality
+   test at MNIST cost. Real text-to-image adds a captioned dataset, a frozen text encoder,
    and a VAE for latent diffusion — four new systems and a training run too
    expensive to iterate on. This teaches the same lesson in minutes.
 
-3. **Flow matching / rectified flow** — DDPM/DDIM is the SD1/SD2-era
+2. **Flow matching / rectified flow** — DDPM/DDIM is the SD1/SD2-era
    formulation; SD3 and Flux use a straight-line path from noise to data,
    predicting velocity instead of eps. Simpler than what is already written —
    no beta schedule, no posterior-variance algebra — and it slots in beside

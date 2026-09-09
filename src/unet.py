@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from attention import Attention
 from resblock import ResBlock
 from timestep_embedding import timestep_embedding
 
@@ -42,6 +43,7 @@ class UNet(nn.Module):
         time_dim: int = 256,
         groups: int = 8,
         num_classes: int | None = None,
+        attention: bool = False,
     ):
         super().__init__()
         self.base, self.mults = base, mults
@@ -69,6 +71,9 @@ class UNet(nn.Module):
                 skip_chs.append(ch)
 
         self.mid1 = ResBlock(ch, ch, time_dim, groups)
+        # bottleneck only: at 28x28 self-attention is 784² pairs per head, and the
+        # 7x7 bottleneck already carries what the whole image contributed
+        self.mid_attn = Attention(ch, groups=groups) if attention else None
         self.mid2 = ResBlock(ch, ch, time_dim, groups)
 
         self.up = nn.ModuleList()
@@ -105,7 +110,10 @@ class UNet(nn.Module):
         for m in self.down:
             h = m(h, temb) if isinstance(m, ResBlock) else m(h)
             hs.append(h)
-        h = self.mid2(self.mid1(h, temb), temb)
+        h = self.mid1(h, temb)
+        if self.mid_attn is not None:
+            h = self.mid_attn(h)
+        h = self.mid2(h, temb)
         for m in self.up:
             if isinstance(m, ResBlock):
                 h = m(torch.cat([h, hs.pop()], dim=1), temb)
