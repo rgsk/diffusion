@@ -1,7 +1,8 @@
 # Roadmap
 
 Updated 2026-09-09. One concept per file in `src/`, each with a `__main__` that
-tests it. Run any file directly.
+tests it. Run any file directly. Direction only — measurements and what they
+showed live in `results.md`.
 
 ## Done
 
@@ -18,17 +19,15 @@ tests it. Run any file directly.
   `--ddim-steps`, `--num-classes`. Runs land in `artifacts/scratch` (wiped each
   run) or `artifacts/{name}_{timestamp}`, with `train.log` written beside the
   grids.
-- **class conditioning** — `UNet(num_classes=...)` embeds the label and adds it
-  to `temb`, on the same footing as `t`. The embedding has `num_classes + 1`
-  rows: index `num_classes` is the null label, reserved unused so CFG can use
-  these same weights instead of forcing a retrain. `Conditioned(net, y)` freezes
-  `y` back into the `(x, t) -> eps` interface the samplers already call.
-  `main.py` conditions by default and draws one class per grid row.
-  Verified by overfitting one digit per class and scoring the same `x_t` under
-  the right and a wrong label: eps-MSE 0.0218 vs 0.0867. A label that is wired
-  up but ignored passes every other check in `unet.py` and fails only that one.
-  Four epochs gives rows that are legibly their own digit, with a few strays —
-  the obedience gap CFG is meant to close.
+- **class conditioning** — `UNet(num_classes=...)` embeds the label into `temb`,
+  with a reserved untrained null row at index `num_classes` so CFG can reuse
+  these weights. `Conditioned(net, y)` freezes `y` back into the `(x, t) -> eps`
+  interface the samplers call, so neither sampler changed. `main.py` conditions
+  by default and draws one class per grid row.
+- `class_conditioning.ipynb` — probes against a trained checkpoint: label sweep
+  at fixed `x_T`, the null row, right-vs-wrong label by `t`, conditional vs
+  unconditional by `t`. Cell 1 is all imports and helpers; every probe below
+  runs on its own.
 
 ## Next
 
@@ -36,9 +35,10 @@ Ordered. (1)-(3) are knobs and diagnostics, an afternoon each. (4)-(6) are the
 rest of the mechanism by which a model is told what to make. (7) is the
 formulation today's models use instead of the one implemented above.
 
-1. **Loss bucketed by `t`** — the metric that tracks what the eye sees. The
-   average is dominated by high `t`, where nobody beats chance; per-bucket it
-   shows which part of the chain is actually improving.
+1. **Loss bucketed by `t`, in the training loop** — `class_conditioning.ipynb`
+   already measures it offline; what is missing is `main.py` logging it per
+   epoch. The pooled average is dominated by *low* `t` (`results.md`), so gains
+   at high `t` never reach the number a run prints.
 2. **EMA of weights** — standard in DDPM, usually a visible quality win.
 3. **Cosine schedule** — linear betas destroy MNIST's signal early.
 
