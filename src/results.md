@@ -257,4 +257,49 @@ is on 64x64 ImageNet, where the model is capacity-bound and the wasted
 high-noise steps are a real cost; here a 4.17M-param net on 28x28 has capacity
 to spare, so buying low-noise accuracy with high-noise accuracy nets out flat.
 The cheap 1-2% gain sits in the region that matters most for perceptual detail,
-which is the argument for keeping it — not the loss numbers.
+which is the argument for keeping it — not the loss numbers. Kept: `--schedule`
+defaults to cosine from 2026-09-09.
+
+## Classifier-free guidance — `cfg_2026-09-09_18-17-27`
+
+8 epochs, cosine, label dropout 0.1, EMA weights, DDIM 50. Obedience is judged
+by a small CNN trained on MNIST for the purpose (98.3% test accuracy); diversity
+is across-sample pixel std within each class, at a fixed `x_T` shared by every w.
+
+| w | label accuracy | diversity | pixels at ±1 |
+| --- | --- | --- | --- |
+| 0.0 | 0.065 | 0.3631 | 0.499 |
+| 1.0 | 0.945 | 0.3091 | 0.510 |
+| 1.5 | 0.990 | 0.2948 | 0.519 |
+| 2.0 | 0.995 | 0.2876 | 0.513 |
+| 3.0 | 1.000 | 0.2798 | 0.480 |
+| 5.0 | 1.000 | 0.2768 | 0.381 |
+| 8.0 | 1.000 | 0.2789 | 0.239 |
+| 15.0 | 1.000 | 0.2966 | 0.115 |
+
+The trade is exactly as advertised, and it is cheap: **w=1.5 buys 4.5 points of
+obedience for 5% of the diversity**, and by w=3 the judge is never wrong. w=0 is
+the sanity check — 6.5%, below the 10% a coin would get, because unconditional
+samples are not reliably any digit.
+
+Two MNIST-specific surprises:
+
+**Diversity is not monotonic.** It bottoms out at w=5 (0.2768) and *rises* again
+by w=15 (0.2966). That is not returning variety — it is damage. Past w≈8 the
+strokes erode into hollow, speckled outlines, and the speckle is pixel variance
+the metric cannot tell apart from genuine variation. Any diversity number needs
+the grid beside it.
+
+**Nothing oversaturates.** The literature's "oversaturated garbage" at high w is
+an RGB failure; here the fraction of pixels pinned at ±1 *falls* by more than
+half, 0.51 → 0.115. Overshooting eps thins the strokes rather than blowing out
+colour, and DDIM's x0 clamp absorbs what is left. Same mechanism, different
+symptom — the failure mode is legibility, not saturation.
+
+Cost is one extra forward per step at w≠1, batched into one pass. `Guided`
+short-circuits to a single call at w=1 exactly, where the two branches cancel.
+
+Reproduced in `cfg.ipynb`. Re-running moves the top of the accuracy curve by
+about half a point (w=2 read 0.995 once and 1.000 the next time) — cuDNN is
+nondeterministic, and `--seed` pairs runs without making them bitwise equal.
+Differences that small are not findings.

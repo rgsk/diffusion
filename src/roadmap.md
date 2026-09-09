@@ -38,12 +38,20 @@ showed live in `results.md`.
   back into betas, with `s` off the flat peak and a `max_beta` cap at the t=T
   singularity. `ForwardProcess(schedule="cosine")` and `main.py --schedule`.
   Compared in closed form (`cosine_schedule.ipynb`) and trained head-to-head
-  against linear (`results.md`): the trade is real but nets out flat on MNIST,
-  so `--schedule linear` stays the default.
+  against linear (`results.md`): the trade is real but nets out flat on MNIST.
+  Kept as the default anyway — the 1-2% it buys sits at low `t`, where detail is.
 - `main.py --seed` — init, shuffling and noise, so two runs differing in one
   flag differ in that flag alone. Pairs runs; does not make them bitwise
   reproducible (cuDNN autotuning and atomics), which would need
   `use_deterministic_algorithms` and a throughput cost.
+- `cfg.py` — classifier-free guidance. `drop_labels` swaps a fraction of labels
+  for the reserved null token during training; `Guided(net, y, w)` freezes
+  `(y, w)` into the samplers' `(x, t) -> eps` interface and returns
+  `eps_∅ + w·(eps_y - eps_∅)`, both branches in one doubled batch. `main.py
+  --label-dropout` (0.1 by default) and `--guidance`. Swept in `results.md`:
+  w=1.5 costs 5% diversity for 99% label accuracy. `cfg.ipynb` sweeps it: the
+  two curves, and the grids that show what the diversity number stops meaning
+  past w≈8.
 - `class_conditioning.ipynb` — probes against a trained checkpoint: label sweep
   at fixed `x_T`, the null row, right-vs-wrong label by `t`, conditional vs
   unconditional by `t`. Cell 1 is all imports and helpers; every probe below
@@ -51,23 +59,14 @@ showed live in `results.md`.
 
 ## Next
 
-Ordered. (1)-(3) are the rest of the mechanism by which a model is told what to
-make. (4) is the formulation today's models use instead of the one implemented
+Ordered. (1)-(2) are the rest of the mechanism by which a model is told what to
+make. (3) is the formulation today's models use instead of the one implemented
 above.
 
-1. **Classifier-free guidance** — the engine of every conditional model. Drop
-   the label to a null token with p≈0.1 during training, so one net learns both
-   `eps(x_t, t, y)` and `eps(x_t, t, ∅)`; at sample time
-   `eps = eps_uncond + w * (eps_cond - eps_uncond)`. Sweep `w` and watch: 0 is
-   unconditional, ~3 is sharp and obedient, ~15 is oversaturated garbage.
-   Guidance does not sample the conditional distribution — it samples a
-   sharpened `p(x)·p(y|x)^w`, so the diversity loss at high `w` is the
-   mechanism, not a bug. `sampler.py`'s Gaussian oracle can measure exactly
-   that: std shrinking as `w` rises.
-2. **Attention** — self-attention at 7×7, and cross-attention (image positions
+1. **Attention** — self-attention at 7×7, and cross-attention (image positions
    as queries, conditioning tokens as keys/values). Same block, different KV
-   source. Not a polish item: it is the prerequisite for (3).
-3. **Colored digits on 32×32 with synthetic captions** — "a red 3 in the top
+   source. Not a polish item: it is the prerequisite for (2).
+2. **Colored digits on 32×32 with synthetic captions** — "a red 3 in the top
    left". Adding a pooled vector to `temb` is enough for 10 classes and fails
    for sentences, because binding an attribute to an object needs
    cross-attention. Hold out some colour×digit combinations from training and
@@ -76,7 +75,7 @@ above.
    and a VAE for latent diffusion — four new systems and a training run too
    expensive to iterate on. This teaches the same lesson in minutes.
 
-4. **Flow matching / rectified flow** — DDPM/DDIM is the SD1/SD2-era
+3. **Flow matching / rectified flow** — DDPM/DDIM is the SD1/SD2-era
    formulation; SD3 and Flux use a straight-line path from noise to data,
    predicting velocity instead of eps. Simpler than what is already written —
    no beta schedule, no posterior-variance algebra — and it slots in beside

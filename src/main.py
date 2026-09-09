@@ -11,12 +11,13 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from torchvision.utils import save_image
 
+from cfg import Guided, drop_labels
 from ddim import DDIMSampler
 from ema import EMA
 from forward_process import ForwardProcess
 from loss_by_t import LossByT
 from sampler import DDPMSampler
-from unet import Conditioned, UNet
+from unet import UNet
 from utils import repo_root
 
 
@@ -76,6 +77,8 @@ def main(
     ema_decay: float = 0.999,
     schedule: str = "linear",
     seed: int = 0,
+    label_dropout: float = 0.1,
+    guidance: float = 1.0,
 ):
     root = repo_root()
     out = run_dir(name)
@@ -108,7 +111,8 @@ def main(
         f"sampler {sampler}  {getattr(smp, 'steps', fp.T)} steps  "
         f"schedule {schedule}\n"
         f"classes {num_classes or 'unconditional'}  "
-        f"ema {ema_decay or 'off'}\n"
+        f"ema {ema_decay or 'off'}  "
+        f"label dropout {label_dropout}  guidance {guidance}\n"
         f"seed {seed}\n"
         f"device {dev}  params {sum(p.numel() for p in net.parameters()) / 1e6:.2f}M  "
         f"{len(loader)} steps/epoch\n"
@@ -130,7 +134,13 @@ def main(
         by_t = LossByT(fp.T, loss_buckets, dev)
         for x0, y in loader:
             x0 = x0.to(dev)
-            y = y.to(dev) if num_classes else None
+            # dropped per sample and redrawn every step, so one net learns both
+            # eps(x,t,y) and eps(x,t,null) from the same images
+            y = (
+                drop_labels(y.to(dev), label_dropout, num_classes)
+                if num_classes
+                else None
+            )
             t = fp.sample_t(x0.shape[0], dev)
             noise = torch.randn_like(x0)
             # per image, then mean: same gradient as mse_loss, but the split by t
@@ -152,7 +162,7 @@ def main(
         # the grid is what the run is judged on, so draw it from the weights that
         # would actually ship -- the averaged ones
         with ema.as_weights(net) if ema else nullcontext():
-            model = net if y_grid is None else Conditioned(net, y_grid)
+            model = net if y_grid is None else Guided(net, y_grid, guidance)
             x = smp.sample(model, (n, 1, 28, 28), dev)
         save_image(
             x.cpu(),
@@ -227,6 +237,18 @@ def parse_args() -> argparse.Namespace:
         help="beta schedule for the forward process",
     )
     p.add_argument("--seed", type=int, default=0, help="init, shuffling, and noise")
+    p.add_argument(
+        "--label-dropout",
+        type=float,
+        default=0.1,
+        help="probability of training a step on the null label; 0 disables CFG",
+    )
+    p.add_argument(
+        "--guidance",
+        type=float,
+        default=1.0,
+        help="guidance scale w for the epoch grid; 1 is the plain conditional net",
+    )
     return p.parse_args()
 
 
