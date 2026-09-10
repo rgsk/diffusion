@@ -64,6 +64,23 @@ def swap_colors(text: str) -> str:
     return " ".join(w)
 
 
+# the caption is fixed-length and fixed-shape, so the colour words are always
+# these two slots: "a C D in the P1 P2 and a C D in the P1 P2"
+COLOR_SLOTS = (1, 9)
+
+
+def swap_color_tokens(y: Tensor) -> Tensor:
+    """`swap_colors` on encoded tokens: [B, SEQ_LEN_PAIR] -> the same, with the
+    two colour ids exchanged. The training loop has tokens, not text, and
+    re-encoding a batch of strings every step would cost more than the forward
+    pass it feeds."""
+    assert y.shape[-1] == SEQ_LEN_PAIR, y.shape
+    out = y.clone()
+    i, j = COLOR_SLOTS
+    out[:, [i, j]] = out[:, [j, i]]
+    return out
+
+
 def pair_attributes(i: int, seed: int, n: int) -> tuple[int, int, int, int, int]:
     """(partner offset, colour1, corner1, colour2, corner2) for MNIST index i.
     A function of the index alone, as in `colored_mnist`, so the dataset is the
@@ -194,6 +211,14 @@ if __name__ == "__main__":
     assert sw == "a blue 3 in the top left and a red 7 in the bottom right"
     assert swap_colors(sw) == t  # an involution
     assert sorted(sw.split()) == sorted(t.split()) and sw != t  # same bag, new order
+
+    # and the token-level twin must agree with it exactly, or the loss that
+    # trains on negatives and the eval that scores them disagree about what a
+    # negative is -- a bug that would look like the model failing
+    tk = encode(t, SEQ_LEN_PAIR)[None]
+    assert torch.equal(swap_color_tokens(tk)[0], encode(sw, SEQ_LEN_PAIR))
+    assert torch.equal(swap_color_tokens(swap_color_tokens(tk)), tk)  # involution
+    assert decode(swap_color_tokens(tk)[0]) == swap_colors(t)
 
     ds = TwoObjectMNIST()
     x, tok = ds[0]

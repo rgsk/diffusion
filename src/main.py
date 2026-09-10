@@ -22,8 +22,9 @@ from ddim import DDIMSampler
 from ema import EMA
 from forward_process import ForwardProcess
 from loss_by_t import LossByT
+from negatives import per_sample_mse, swap_hinge
 from sampler import DDPMSampler
-from two_objects import TwoObjectMNIST, pair_prompt_grid
+from two_objects import TwoObjectMNIST, pair_prompt_grid, swap_color_tokens
 from unet import UNet
 from utils import repo_root
 
@@ -90,8 +91,13 @@ def main(
     dataset: str = "mnist",
     pooled_context: bool = False,
     text_layers: int = 0,
+    coords: bool = False,
+    swap_weight: float = 0.0,
+    swap_margin: float = 0.1,
 ):
     assert dataset in ("mnist", "colored", "pair"), dataset
+    # the negative is a colour swap, which only names two objects on the pair set
+    assert not swap_weight or dataset == "pair", "--swap-weight needs --dataset pair"
     root = repo_root()
     out = run_dir(name)
     log = logger(out)
@@ -130,6 +136,7 @@ def main(
         vocab_size=vocab_size,
         pooled=pooled_context,
         text_layers=text_layers,
+        coords=coords,
     ).to(dev)
     smp = build_sampler(fp, sampler, ddim_steps).to(dev)
     opt = torch.optim.Adam(net.parameters(), lr=lr)
@@ -144,7 +151,9 @@ def main(
         f"classes {num_classes or 'unconditional'}  "
         f"vocab {vocab_size or '-'}"
         f"{' (pooled into temb)' if vocab_size and pooled_context else ''}"
-        f"{f' text-encoder x{text_layers}' if vocab_size and text_layers else ''}  "
+        f"{f' text-encoder x{text_layers}' if vocab_size and text_layers else ''}"
+        f"{' coords' if vocab_size and coords else ''}"
+        f"{f' swap-negatives w{swap_weight} m{swap_margin}' if swap_weight else ''}  "
         f"ema {ema_decay or 'off'}  "
         f"label dropout {label_dropout}  guidance {guidance}  "
         f"attention {attention}\n"
@@ -189,6 +198,8 @@ def main(
         net.train()
         start = time.time()
         by_t = LossByT(fp.T, loss_buckets, dev)
+        hinge_sum = torch.zeros((), device=dev)
+        hinge_n = torch.zeros((), device=dev, dtype=torch.long)
         for x0, y in loader:
             x0 = x0.to(dev)
             # dropped per sample and redrawn every step, so one net learns both
@@ -202,11 +213,30 @@ def main(
             )
             t = fp.sample_t(x0.shape[0], dev)
             noise = torch.randn_like(x0)
+            xt = fp.q_sample(x0, t, noise)
+            if swap_weight:
+                # both branches in one doubled batch, as CFG does it
+                yn = swap_color_tokens(y)
+                both = net(torch.cat([xt, xt]), torch.cat([t, t]), torch.cat([y, yn]))
+                eps, eps_neg = both.chunk(2)
+            else:
+                eps, eps_neg = net(xt, t, y), None
             # per image, then mean: same gradient as mse_loss, but the split by t
             # survives instead of being pooled away
-            eps = net(fp.q_sample(x0, t, noise), t, y)
-            se = (eps - noise).pow(2).flatten(1).mean(1)
+            se = per_sample_mse(eps, noise)
             loss = se.mean()
+            if eps_neg is not None:
+                # a dropped caption is all-null, so its swap is itself and the
+                # hinge would be an unsatisfiable constant on those rows
+                real = (y != net.null_label).any(1)
+                h = swap_hinge(se, per_sample_mse(eps_neg, noise), swap_margin)
+                h = torch.where(real, h, torch.zeros_like(h))
+                n_real = real.sum()
+                # kept on the GPU and read once per epoch: an .item() here is a
+                # sync every step, which costs more than the extra branch does
+                hinge_sum += h.sum().detach()
+                hinge_n += n_real
+                loss = loss + swap_weight * h.sum() / n_real.clamp(min=1)
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -234,7 +264,9 @@ def main(
                 )
                 rng = rng or f"[{x.min():.2f}, {x.max():.2f}]"
         log(
-            f"epoch {epoch}  loss {by_t.pooled():.4f}  train {train_s:.0f}s  "
+            f"epoch {epoch}  loss {by_t.pooled():.4f}  "
+            f"{f'hinge {hinge_sum.item() / max(int(hinge_n), 1):.4f}  ' if swap_weight else ''}"
+            f"train {train_s:.0f}s  "
             f"sample {time.time() - start:.0f}s  range {rng}\n"
             + "  by t:     "
             + cols([f"{m:.4f}" for m in by_t.means()], labels)
@@ -252,6 +284,9 @@ def main(
                 "vocab_size": vocab_size,
                 "pooled": pooled_context,
                 "text_layers": text_layers,
+                "coords": coords,
+                "swap_weight": swap_weight,
+                "swap_margin": swap_margin,
                 "in_ch": in_ch,
                 "image_size": size,
                 "dataset": dataset,
@@ -328,6 +363,26 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="self-attention blocks over the token sequence before the U-Net "
         "reads it; 0 reproduces the runs that assign attributes at chance",
+    )
+    p.add_argument(
+        "--coords",
+        action="store_true",
+        help="2D position code on the cross-attention queries, so a query can "
+        "say which position is asking; adds no parameters",
+    )
+    p.add_argument(
+        "--swap-weight",
+        type=float,
+        default=0.0,
+        help="weight on the hinge that requires the colour-swapped caption to "
+        "score worse than the true one; 0 is the plain eps objective",
+    )
+    p.add_argument(
+        "--swap-margin",
+        type=float,
+        default=0.1,
+        help="share of the pair's error the swapped caption must own, above an "
+        "even 0.5 split; 0.1 asks for 1.5x the true caption's",
     )
     p.add_argument(
         "--attention",

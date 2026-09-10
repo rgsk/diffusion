@@ -8,11 +8,18 @@ Self-attention takes Q, K and V from the image. Cross-attention takes Q from the
 image and K, V from conditioning tokens -- the same block, a different source
 for KV, and the mechanism that binds an attribute to an object ("a red 3 in the
 top left"), which adding one pooled vector to `temb` cannot do.
+
+`coords=True` adds a fixed position code to Q only (`coords.py`), so a query can
+say which position is asking. Q only, and not the residual stream: the features
+flowing through the U-Net stay translation-equivariant, and it is the question
+being asked that becomes position-dependent, not the image.
 """
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+
+from coords import coord_embedding
 
 
 class Attention(nn.Module):
@@ -21,7 +28,10 @@ class Attention(nn.Module):
 
     Output projection is zero-init, like `ResBlock.conv2` and `UNet.out_conv`, so
     a fresh block is exactly its skip and adding attention cannot make a net
-    worse at step 0."""
+    worse at step 0.
+
+    `coords=True` adds no parameters, so a run with it and its control have
+    identical state dicts and the comparison is the coordinates alone."""
 
     def __init__(
         self,
@@ -29,10 +39,11 @@ class Attention(nn.Module):
         heads: int = 4,
         groups: int = 8,
         context_dim: int | None = None,
+        coords: bool = False,
     ):
         super().__init__()
         assert ch % heads == 0, (ch, heads)
-        self.heads, self.context_dim = heads, context_dim
+        self.heads, self.context_dim, self.coords = heads, context_dim, coords
         self.norm = nn.GroupNorm(groups, ch)
         self.to_q = nn.Conv2d(ch, ch, 1)
         # 1x1 conv over the image for self, Linear over the token sequence for cross
@@ -53,7 +64,12 @@ class Attention(nn.Module):
     def forward(self, x: Tensor, context: Tensor | None = None) -> Tensor:
         B, C, H, W = x.shape
         h = self.norm(x)
-        q = self.to_q(h).reshape(B, C, H * W).transpose(1, 2)  # positions = sequence
+        # the query alone learns where it is asking from; K, V and the residual
+        # are untouched
+        q_in = h
+        if self.coords:
+            q_in = h + coord_embedding(H, W, C, device=h.device).to(h.dtype)
+        q = self.to_q(q_in).reshape(B, C, H * W).transpose(1, 2)  # positions = sequence
         if self.context_dim is None:
             assert context is None, "self-attention block was handed a context"
             kv = self.to_kv(h).reshape(B, 2 * C, H * W).transpose(1, 2)
@@ -126,6 +142,29 @@ if __name__ == "__main__":
             raise SystemExit("guard missing")
         except AssertionError:
             pass
+
+    # 6. coords: the query knows where it is asking from. Test 3 is the control
+    #    -- the same block without coords permutes with its input, and this one
+    #    must not, or nothing has been added.
+    coord = live(context_dim=D, coords=True)
+    got = coord(permuted, ctx).reshape(B, C, S * S)
+    want = coord(x, ctx).reshape(B, C, S * S)[:, :, perm]
+    moved = (got - want).abs().max()
+    print(f"coords break permutation equivariance by {moved:.4f}")
+    assert moved > 1e-3
+
+    # 7. it costs nothing: no parameters and no state-dict keys, so a run with
+    #    coords and its control differ in the flag and in nothing else
+    assert [k for k, _ in coord.named_parameters()] == [
+        k for k, _ in cross.named_parameters()
+    ]
+    assert sum(p.numel() for p in coord.parameters()) == sum(
+        p.numel() for p in cross.parameters()
+    )
+    coord.load_state_dict(cross.state_dict())  # and the control's weights load
+    # ...which makes this the sharpest statement of what coords do: identical
+    # weights, identical input, different answer, entirely because of position
+    assert not torch.allclose(coord(x, ctx), cross(x, ctx))
 
     print(f"self {sum(p.numel() for p in Attention(C).parameters()) / 1e3:.1f}k params")
     print("ok")

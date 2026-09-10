@@ -18,6 +18,7 @@ from colored_mnist import SEQ_LEN, encode, prompt_grid
 from ddim import DDIMSampler
 from forward_process import ForwardProcess
 from sampler import DDPMSampler
+from two_objects import SEQ_LEN_PAIR, pair_prompt_grid
 from unet import UNet
 from utils import repo_root
 
@@ -45,12 +46,15 @@ def load(run: str, device: str, weights: str = "ema"):
         vocab_size=V,
         pooled=ck.get("pooled", False),
         text_layers=ck.get("text_layers", 0),
+        coords=ck.get("coords", False),  # adds no weights, so only the key says
     )
     net.load_state_dict(state)
     fp = ForwardProcess()
     fp.load_state_dict(ck["fp"])  # schedule buffers, whichever schedule it was
     shape = (ck.get("in_ch", 1), ck.get("image_size", 28), ck.get("image_size", 28))
-    return net.to(device).eval(), fp.to(device), shape
+    # which dataset wrote this decides how long a caption is; a pair run's
+    # prompt names two objects and does not fit the single-object length
+    return net.to(device).eval(), fp.to(device), shape, ck.get("dataset", "mnist")
 
 
 def slug(text: str) -> str:
@@ -70,7 +74,7 @@ def main(
     out: str = "",
 ):
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    net, fp, shape = load(run, dev, weights)
+    net, fp, shape, dataset = load(run, dev, weights)
     C, V = net.num_classes, net.vocab_size
     smp = DDPMSampler(fp) if sampler == "ddpm" else DDIMSampler(fp, steps=steps)
     smp = smp.to(dev)
@@ -79,10 +83,14 @@ def main(
 
     if V is not None:
         assert label < 0, f"{run} is captioned -- ask it with --prompt, not --label"
+        seq_len = SEQ_LEN_PAIR if dataset == "pair" else SEQ_LEN
         if prompt:
             # encode() raises on an unknown word rather than encoding a shrug
-            y = encode(prompt).to(dev).expand(n, SEQ_LEN)
+            y = encode(prompt, seq_len).to(dev).expand(n, seq_len)
             nrow, tag = min(n, 8), slug(prompt)
+        elif dataset == "pair":
+            y, nrow, _ = pair_prompt_grid(dev)  # each pair beside its colour swap
+            tag = "grid"
         else:
             y, nrow, _ = prompt_grid(dev)  # every colour x every digit
             tag = "grid"

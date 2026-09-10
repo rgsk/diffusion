@@ -42,7 +42,9 @@ class UNet(nn.Module):
     added to `temb`, which reaches every pixel identically. A caption is a
     sequence read by cross-attention after every ResBlock, and never touches
     `temb` at all -- so nothing about a caption is pooled before the net sees it,
-    and each position picks out the words that concern it."""
+    and each position picks out the words that concern it. `coords=True` tells
+    each of those positions where it is (`coords.py`), which is what "the words
+    that concern it" needs in order to mean anything."""
 
     def __init__(
         self,
@@ -61,6 +63,7 @@ class UNet(nn.Module):
         null_token: int = 0,
         pooled: bool = False,
         text_layers: int = 0,
+        coords: bool = False,
     ):
         super().__init__()
         self.base, self.mults = base, mults
@@ -105,7 +108,15 @@ class UNet(nn.Module):
             if pooled:
                 self.context_pool = nn.Linear(context_dim, time_dim)
         cross_on = vocab_size is not None and not pooled
-        cross = {"heads": cross_heads, "groups": groups, "context_dim": context_dim}
+        # coords go on the cross blocks only: it is the caption lookup that needs
+        # to know which position is asking. Free in parameters, so `--coords` and
+        # its control have identical state dicts (`attention.py`, test 7).
+        cross = {
+            "heads": cross_heads,
+            "groups": groups,
+            "context_dim": context_dim,
+            "coords": coords,
+        }
         self.conv_in = nn.Conv2d(in_ch, base, 3, padding=1)
 
         ch, skip_chs = base, [base]  # channel counts the up path will concat back
@@ -512,5 +523,31 @@ if __name__ == "__main__":
         moved = (c[:, 2] - d[:, 2]).abs().max()
         print(f"unmoved token changes by {moved:.4f} once the encoder reads it")
         assert moved > 1e-3
+
+    # 14. coords: test 13 fixed the text side of the lookup and `README.md`
+    #     records that binding still failed at chance, which leaves the image
+    #     side -- a query built by translation-equivariant convs does not know
+    #     where it is. The check here is only that the coordinates reach the
+    #     queries and change the answer; whether that buys binding is a training
+    #     run, and `binding.py` is the eval.
+    co = UNet(in_ch=3, vocab_size=V, coords=True)
+    assert all(m.coords for m in co.modules() if isinstance(m, Attention))
+    assert torch.equal(co(xt3, tc, toks), torch.zeros_like(xt3))  # zero-init holds
+    # no new weights, so the control's are loadable and the runs differ in the
+    # coordinates alone -- not in capacity, which would be a rival explanation
+    plain = UNet(in_ch=3, vocab_size=V)
+    assert [k for k, _ in co.named_parameters()] == [
+        k for k, _ in plain.named_parameters()
+    ]
+    co.load_state_dict(plain.state_dict())
+    with torch.no_grad():  # de-zero, or both nets predict exactly zero
+        nn.init.normal_(plain.out_conv.weight, std=0.05)
+        for m in plain.modules():
+            if isinstance(m, Attention):
+                nn.init.normal_(m.proj.weight, std=0.05)
+        co.load_state_dict(plain.state_dict())  # copy again, now that it is live
+        moved = (co(xt3, tc, toks) - plain(xt3, tc, toks)).abs().max()
+    print(f"identical weights, coords move eps by {moved:.4f}")
+    assert moved > 1e-3
 
     print("ok")

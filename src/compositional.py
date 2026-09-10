@@ -186,7 +186,7 @@ def main(
 ):
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(seed)
-    net, fp, shape = load(run, dev, weights)
+    net, fp, shape, _ = load(run, dev, weights)
     assert net.vocab_size is not None, f"{run} is not a captioned run"
     assert shape == (3, 32, 32), shape
 

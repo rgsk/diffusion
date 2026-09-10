@@ -7,8 +7,9 @@ variant, on a single RTX 4060. One concept per file in `src/`, each with a
 The point is not the samples. It is what each piece measurably does once it is
 in, which is often not what the paper's summary suggests: the training loss is
 blind to a sampler that has collapsed to a point mass, self-attention buys
-nothing at 28x28, and cross-attention does not bind "red" to "3" without
-something the image side of the network does not have.
+nothing at 28x28, and four rounds of architecture aimed at binding "red" to "3"
+all failed at chance until the objective was changed to ask for it — after which
+the plainest of the four succeeded, having been capable the whole time.
 
 ![conditional samples, one digit per row](docs/conditional_mnist.png)
 
@@ -130,7 +131,9 @@ grids; `--name scratch` reuses one folder and wipes it each run.
   recoverable from the multiset of words, which single-object images never were.
   `swap_colors` exchanges the two colour words (the probe the eval rests on) and
   `isolate` blanks all but one corner, so the single-object judge scores a
-  two-object image without retraining.
+  two-object image without retraining. `swap_color_tokens` is the same swap on
+  encoded tokens, for the training loop, asserted against the text version so the
+  loss and the eval cannot disagree about what a negative is.
 - `binding.py` — scores `colours present` (what a bag of words can get right)
   against `colours bound` (which colour went where). The failure mode is the
   clean swap, counted directly.
@@ -140,8 +143,39 @@ grids; `--name scratch` reuses one folder and wipes it each run.
   attends to it: the stage a real model gets from CLIP. Zero-init residual
   projections, as everywhere else here, and it does not own the embedding table,
   so every earlier captioned checkpoint still loads as the control.
-  `UNet(text_layers=n)`, `main.py --text-layers`.
+  `UNet(text_layers=n)`, `main.py --text-layers`. Not needed for binding at this
+  scale — no successful run has it — and kept for captions with real syntax,
+  where contextualising the words should start to matter.
   → [what it showed](#a-text-encoder-does-not-fix-binding)
+- `coords.py` — 2D sinusoidal position code for the cross-attention queries, so
+  a query can say which position is asking. Added to Q only, never to the
+  residual stream: the features flowing through the U-Net stay
+  translation-equivariant, and it is the question that becomes
+  position-dependent, not the image. Normalized to a canonical 32-pixel canvas
+  rather than raw indices, so the same place gets the same code at every
+  resolution the U-Net visits. Fixed rather than learned, because the previous
+  positional signal here trained to 2% of its norm and never became usable — and
+  a closed form adds no parameters, so `UNet(coords=True)` (`main.py --coords`)
+  and its control have identical state dicts. Not needed for binding at this
+  scale either, and kept for larger canvases where telling one location from
+  another is genuinely hard.
+  → [what it showed](#coordinates-do-not-fix-it-either-and-rule-out-the-architecture),
+  [and the ablation](#what-was-actually-necessary)
+- `negatives.py` — the loss term that charges for getting the assignment wrong.
+  `swap_hinge` requires the colour-swapped caption to own more than half the
+  pair's error: `mse_neg / (mse_pos + mse_neg) >= 0.5 + margin`. A *share* rather
+  than a ratio, because "make the wrong caption score worse" otherwise has a
+  cheaper solution than binding — be worse at everything — and a model that
+  cannot tell the two captions apart raises both errors together. The first
+  version of the file did exactly that and collapsed training to E[eps²] on
+  contact; a share is invariant to wrecking both, so the escape route is closed
+  by construction rather than by tuning. Scale-free across the 50x span of
+  eps-MSE by `t`, and per-sample, so answers already right stop paying.
+  `main.py --swap-weight` (0 is the plain objective) and `--swap-margin`, with
+  the two branches in one doubled batch as CFG does it, dropped captions masked
+  out (an all-null caption's swap is itself), and the per-epoch `hinge` printed
+  beside the loss.
+  → [what it showed](#charging-the-loss-for-the-assignment-fixes-it)
 
 ---
 
@@ -649,8 +683,8 @@ Stated in advance: `colours bound` should separate from `colours present`.
 | | colours present | colours bound | colours swapped | both bound |
 | --- | --- | --- | --- | --- |
 | pooled | 0.844 | 0.418 | 0.426 | 0.193 |
-| cross-attention | 0.842 | 0.405 | 0.436 | 0.183 |
-| cross-attention + text encoder | 0.840 | **0.402** | 0.438 | 0.177 |
+| cross-attn | 0.842 | 0.405 | 0.436 | 0.183 |
+| cross-attn + text encoder | 0.840 | **0.402** | 0.438 | 0.177 |
 
 **It did not move.** Still `present/2`, still chance. The prediction was wrong.
 
@@ -697,34 +731,182 @@ forward pass. That is the capability nothing here has.
 Four runs now with the same eps-MSE to four decimals (0.0098, 0.0098, and 0.0098)
 and four different answers to the question that matters.
 
+## Coordinates do not fix it either, and rule out the architecture
+
+Run `pair_coords_2026-09-10_12-30-47`. The previous section blamed the image
+side: a query built by translation-equivariant convolutions cannot say *I am the
+top-left one*, so it cannot select the clause that names it. `coords.py` gives it
+a fixed 2D sinusoidal position code, added to Q only. Fixed rather than learned,
+because the last learned positional signal here died at 2% of its norm; and it
+adds no parameters, so this run and `pair_cross` have identical state dicts and
+the comparison is the coordinates alone. 4.72M params both, 83s/epoch both.
+
+Stated in advance, again: `colours bound` should separate from `colours present`.
+
+| | colours present | colours bound | colours swapped | both bound |
+| --- | --- | --- | --- | --- |
+| pooled | 0.844 | 0.418 | 0.426 | 0.193 |
+| cross-attn | 0.842 | 0.405 | 0.436 | 0.183 |
+| cross-attn + text encoder | 0.840 | 0.402 | 0.438 | 0.177 |
+| cross-attn + coords | 0.849 | **0.419** | 0.430 | 0.191 |
+
+**It did not move.** `present/2` is 0.4245 against an observed 0.419. Chance for
+the fourth time, and the second prediction in a row to fail.
+
+**The coordinates are not what failed** — and unlike the last two suspects, this
+one can be cleared rather than merely defended. Same weights, same input, one
+intervention at a time, mean |Δeps| on real images:
+
+| t | drop the whole caption | remove the coordinates | swap the two colour words |
+| --- | --- | --- | --- |
+| 0-200 | 0.0116 | 0.0105 | 0.0002 |
+| 400-600 | 0.0078 | 0.0067 | 0.0001 |
+| 800-1000 | 0.0102 | 0.0083 | 0.0001 |
+
+The coordinates carry **nearly as much weight as the entire caption** — 0.0105
+against 0.0116. This is not `token_pos` repeating: that signal was vestigial,
+this one is load-bearing, and the net reads it hard at every noise level. Every
+part of the mechanism is now present and demonstrably used.
+
+And exchanging the two colour words still moves the prediction by 0.0002, fifty
+times less, with `swap/correct` on eps-MSE at **exactly 1.000** in every bucket —
+the same three decimals the text-encoder run gave. The model has learned "put
+things in the named corners" and "these colours and digits appear" as separate
+competencies, to a high standard, and has never learned the join between them.
+
+So four architectural suspects have now been eliminated in turn: pooling, no
+cross-attention, no contextualised text, no coordinates. What is left is the
+objective. **Nothing in the eps-MSE ever charges the model for getting the
+assignment wrong.** Painting a yellow 0 and a magenta 4 in the two named corners
+scores 1.000 against painting the swap, so gradient descent is indifferent
+between them — and a model indifferent between two answers picks by coin flip,
+which is precisely the number `binding.py` keeps reporting. The architecture was
+never the bottleneck; it was capable all along and was never asked.
+
+Five runs now, five different mechanisms, and one pooled loss of 0.0098 that
+cannot tell any of them apart.
+
+## Charging the loss for the assignment fixes it
+
+Runs `pair_swap_2026-09-10_14-09-12` (cross-attention + coordinates) and
+`pair_swap_cross_2026-09-10_16-19-22` (cross-attention alone). 30 epochs, batch
+64, `--seed 0`, w=3 — identical to their controls in every flag but
+`--swap-weight 0.1`.
+
+Four runs had eliminated four architectural suspects, which left the objective.
+`negatives.py` scores the same `x_t` under the caption's colour-swapped twin and
+requires it to be worse, then adds that to the eps-MSE. One extra forward pass,
+batched the way CFG already batches its two branches.
+
+| | colours present | colours bound | colours swapped | both bound |
+| --- | --- | --- | --- | --- |
+| control (real images) | 1.000 | 1.000 | 0.000 | 0.934 |
+| pooled | 0.844 | 0.418 | 0.426 | 0.193 |
+| cross-attn | 0.842 | 0.405 | 0.436 | 0.183 |
+| cross-attn + text encoder | 0.840 | 0.402 | 0.438 | 0.177 |
+| cross-attn + coords | 0.849 | 0.419 | 0.430 | 0.191 |
+| **cross-attn + hinge** | **1.000** | **1.000** | **0.000** | **0.995** |
+| **cross-attn + coords + hinge** | **1.000** | **1.000** | **0.000** | **0.995** |
+
+**Zero clean swaps in 960 samples**, against roughly 430 in every run above.
+`both bound` beats the real-image control (0.995 vs 0.934) only because w=3
+sharpens generated digits into cleaner prototypes than real handwriting — the
+judge reads them more easily than it reads MNIST.
+
+The eps-MSE probe says the same thing about the mechanism rather than the
+outcome. Scoring a correct caption against its colour-swapped twin on real
+images gave **exactly 1.000**, at every noise level, in all four failures:
+
+| t | correct | colour-swapped | swap/correct | (all four controls) |
+| --- | --- | --- | --- | --- |
+| 0-200 | 0.0219 | 0.2270 | **10.39x** | 1.000 |
+| 400-600 | 0.0070 | 0.0676 | **9.65x** | 1.000 |
+| 800-1000 | 0.0010 | 0.0034 | **3.55x** | 1.000 |
+
+And it is legible while training, which nothing else here was. The hinge is
+pinned at its margin while the model is indifferent and falls as it separates
+the two captions:
+
+```
+epoch     1     4     5     6     8    12    16    20    30
+cross    0.100 0.100 0.034 0.003 0.002 0.001 0.001 0.001 0.001
++coords  0.100 0.100 0.100 0.100 0.100 0.076 0.002 0.001 0.001
+```
+
+### What was actually necessary
+
+Reading the table by column instead of by row: every architecture fails under
+the plain objective, and both tested architectures succeed under the new one.
+The variable is the loss, in every direction it is sliced.
+
+- **The coordinates are unnecessary.** `pair_swap_cross` drops them and matches
+  on every column, converging *sooner* (epoch 5 against 12). They were not idle
+  either — removing them from the trained `pair_coords` moved its eps by 0.0105
+  against 0.0116 for deleting the whole caption. A heavily used mechanism that
+  contributed nothing to the outcome.
+- **The text encoder was never in a working configuration.** Neither successful
+  run has it.
+- **Cross-attention is the one piece that survives**, and its role is narrow: it
+  is the only mechanism that can *represent* the distinction. A pooled caption
+  and its colour swap produce a bit-identical vector — `0.00000000`, because an
+  average does not depend on order, and that holds however large the positional
+  embedding grows. The hinge would be demanding a difference that does not exist
+  in the input, so `pooled + hinge` is impossible by construction rather than by
+  measurement, and is not run.
+
+**Binding was never blocked by capability. It was blocked by incentive.** The
+encoder and the coordinates both made the model *more able* to represent which
+colour goes where, and nothing ever rewarded doing so, so the capacity went to
+what the loss did reward — cleaner denoising, better placement. `pair_cross`,
+the second run of this whole sequence, could already do this. It took four more
+runs to notice that the problem was the thing being held fixed.
+
+Caveats. `colours present` also rose (0.849 to 1.000), so part of the gain is
+painting both requested colours more reliably, not only assigning them — the
+`swapped` column, which goes to exactly zero, is the cleaner claim. The
+swap probe is trained on directly, so a 10x ratio is partly the term doing as it
+was told; `binding.py` scoring generated pixels is the independent measurement.
+`cross + text encoder + hinge` is untested, so the encoder is shown to be
+unnecessary, not useless. And the faster convergence without coordinates is one
+pair of seeds — it could be interference, or it could be noise, and this cannot
+separate them.
+
+Scope: two objects, a 15-token template, a 32x32 canvas. Coordinates should earn
+their place where spatial discrimination is genuinely hard and a text encoder
+where captions have real syntax, the same way `--attention` buys nothing at 28x28
+and would pay at 64x64. What travels is the method, not the null results:
+**before adding mechanism, check whether the objective can see the thing being
+fixed.** Six runs and one afternoon say that check is cheap and skipping it is
+not.
+
 ---
 
 # What's next
 
-Ordered. (1) is unfinished business: the binding work built the mechanism, found
-the task that needs it, and then found that the mechanism alone is not enough.
+Ordered. The binding thread is closed; (1) is the one that moves this project
+forward rather than sideways.
 
-1. **Spatial coordinates in the image stream** — a 2D positional embedding
-   added to the feature maps the cross-attention queries are built from. Above
-   are three runs failing binding at chance (pooled, cross-attention,
-   cross-attention + text encoder) and a diagnosis that rules out the text side:
-   the encoder demonstrably contextualises, and the U-Net's eps is *identical*
-   for a caption and its colour-swapped twin at every noise level, so nothing
-   about the assignment is ever encoded. Cross-attention binds by matching a
-   query to the words about it, and the query is a feature vector at a location
-   that, after translation-equivariant convolutions, does not know where it is.
-   Add coordinates and the query can say *I am the top-left one*. `binding.py` is
-   the eval unchanged and three runs are the control. If this also fails at
-   chance, the next suspects are capacity at 128-dim context for two full object
-   descriptions, and a loss that pays ~1.6x for the caption and 1.0x for its
-   internal structure.
-
-2. **Flow matching / rectified flow** — DDPM/DDIM is the SD1/SD2-era
+1. **Flow matching / rectified flow** — DDPM/DDIM is the SD1/SD2-era
    formulation; SD3 and Flux use a straight-line path from noise to data,
    predicting velocity instead of eps. Simpler than what is already written —
    no beta schedule, no posterior-variance algebra — and it slots in beside
    `sampler.py` as a peer, sharing the same U-Net. The item that makes this
    project about image generation as practised now rather than as it was.
+
+2. **Measure the speed knobs** — every run here is fp32 at batch 64 on an 8GB
+   4060, and a scratch benchmark of the training step suggests that is leaving a
+   lot on the table: 173 s/epoch as run, against 135 with bf16 autocast, 123
+   adding `channels_last`, and 80 adding `torch.compile`. Those are step timings
+   from a throwaway script, not runs — nothing here has been trained under them
+   and the effect on sample quality is unmeasured, which is the whole point of
+   doing it properly. Worth a table beside the sampler-cost one, since a single
+   consumer GPU is what most people reading this have. Larger batches OOM'd in
+   that probe on memory the compile run had not released, so what batch 128
+   actually costs is still unknown.
+
+3. **`cross + text encoder + hinge`** — the one untested cell of the ablation.
+   The encoder is shown to be unnecessary for binding, not useless; this says
+   whether it helps, interferes, or does nothing, and it is one run.
 
 ---
 
