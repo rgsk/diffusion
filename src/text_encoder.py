@@ -3,7 +3,7 @@
 `binding.py` found cross-attention assigning colours to objects at chance, and
 the reason was not the cross-attention: it was what cross-attention had to read.
 The context was `token_emb(y) + token_pos`, and `token_pos` trained to 2% of the
-embedding norm (`results.md`). So the vector at slot 1 said "red" and the vector
+embedding norm (`README.md`). So the vector at slot 1 said "red" and the vector
 at slot 9 said "blue", with almost nothing saying which clause each came from.
 A per-position lookup is only as good as what is there to look up.
 

@@ -86,7 +86,7 @@ class UNet(nn.Module):
             self.token_pos = nn.Parameter(torch.zeros(1, max_tokens, context_dim))
             # Zero-init starts the sequence as a pure bag of words, so any
             # order-dependence is learned rather than assumed. Measured cost of
-            # that purity (`results.md`): token_pos trained to 2% of the
+            # that purity (`README.md`): token_pos trained to 2% of the
             # embedding norm and never became a usable signal, because the net
             # can drive the loss down on word identity alone. With an encoder to
             # read them, positions get a real init and a running start.
@@ -454,7 +454,7 @@ if __name__ == "__main__":
 
     # 12. the pooled baseline: same tokens, meaned into one vector and added to
     #     temb the way a class label is. Structurally it must be the *other*
-    #     thing -- no cross-attention anywhere -- or the comparison in results.md
+    #     thing -- no cross-attention anywhere -- or the comparison in README.md
     #     is between a net and itself.
     pnet = UNet(in_ch=3, vocab_size=V, pooled=True)
     assert not any(isinstance(m, Attention) for m in pnet.modules())
@@ -480,7 +480,7 @@ if __name__ == "__main__":
 
     # 13. the text encoder: the stage that makes the context worth attending to.
     #     Without it, the vector at slot 1 is the word "red" plus a positional
-    #     offset that trained to 2% of its norm (results.md), so cross-attention
+    #     offset that trained to 2% of its norm (`README.md`), so cross-attention
     #     assigns attributes at chance. The property to check is that a token's
     #     vector now depends on the other tokens.
     enc = UNet(in_ch=3, vocab_size=V, text_layers=2)

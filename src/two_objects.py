@@ -1,6 +1,6 @@
 """Two digits on one canvas, and the binding problem for real.
 
-`colored_mnist` put one object in the image, and `results.md` records what that
+`colored_mnist` put one object in the image, and `README.md` records what that
 cost: a caption pooled into a single vector scored exactly as well as
 cross-attention, because a bag {red, 3, top-left} is unambiguous when there is
 only one slot to empty it into. The mechanism was built and never tested.

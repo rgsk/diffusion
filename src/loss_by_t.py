@@ -1,6 +1,6 @@
 """eps-MSE split by t, accumulated from the training draws themselves.
 
-The pooled epoch loss is dominated by low t (`results.md`), so a gain anywhere
+The pooled epoch loss is dominated by low t (`README.md`), so a gain anywhere
 else is invisible in it. Bucketing costs nothing extra: the training step
 already draws a t and a per-sample error, this only keeps a running sum per
 bucket instead of throwing the split away.
