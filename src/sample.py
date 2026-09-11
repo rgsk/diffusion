@@ -16,6 +16,7 @@ from torchvision.utils import save_image
 from cfg import Guided
 from colored_mnist import SEQ_LEN, encode, prompt_grid
 from ddim import DDIMSampler
+from flow import FlowPath, FlowSampler
 from forward_process import ForwardProcess
 from sampler import DDPMSampler
 from two_objects import SEQ_LEN_PAIR, pair_prompt_grid
@@ -49,12 +50,42 @@ def load(run: str, device: str, weights: str = "ema"):
         coords=ck.get("coords", False),  # adds no weights, so only the key says
     )
     net.load_state_dict(state)
-    fp = ForwardProcess()
-    fp.load_state_dict(ck["fp"])  # schedule buffers, whichever schedule it was
+    # the weights are the same shape under either objective and mean different
+    # things, so this key decides what the output is read as. Runs from before
+    # flow matching have no key and are eps by construction.
+    objective = ck.get("objective", "eps")
+    if objective == "flow":
+        proc = FlowPath()  # nothing to restore: a straight line has no schedule
+    else:
+        proc = ForwardProcess()
+        proc.load_state_dict(ck["fp"])  # whichever schedule it was trained on
     shape = (ck.get("in_ch", 1), ck.get("image_size", 28), ck.get("image_size", 28))
     # which dataset wrote this decides how long a caption is; a pair run's
     # prompt names two objects and does not fit the single-object length
-    return net.to(device).eval(), fp.to(device), shape, ck.get("dataset", "mnist")
+    return (
+        net.to(device).eval(),
+        proc.to(device),
+        shape,
+        ck.get("dataset", "mnist"),
+        objective,
+    )
+
+
+def build_sampler(proc, objective: str = "eps", kind: str = "ddim", steps: int = 50):
+    """The sampler a run was trained for. Lives here, beside `load`, because every
+    caller that rebuilds a run needs the same choice made the same way.
+
+    DDIM at 50 steps costs ~1s a grid against DDPM's ~15s; DDPM stays the
+    reference, since it is the process the eps loss is derived from. Flow matching
+    has exactly one sampler -- an ODE has no variance term to select between -- so
+    `kind` applies to the eps objective only, and asking for another is an error
+    rather than a silently ignored flag."""
+    assert objective in ("eps", "flow"), objective
+    assert kind in ("ddim", "ddpm"), kind
+    if objective == "flow":
+        assert kind == "ddim", "flow matching has one sampler; --sampler cannot pick"
+        return FlowSampler(proc, steps=steps)
+    return DDPMSampler(proc) if kind == "ddpm" else DDIMSampler(proc, steps=steps)
 
 
 def slug(text: str) -> str:
@@ -74,10 +105,9 @@ def main(
     out: str = "",
 ):
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    net, fp, shape, dataset = load(run, dev, weights)
+    net, proc, shape, dataset, objective = load(run, dev, weights)
     C, V = net.num_classes, net.vocab_size
-    smp = DDPMSampler(fp) if sampler == "ddpm" else DDIMSampler(fp, steps=steps)
-    smp = smp.to(dev)
+    smp = build_sampler(proc, objective, sampler, steps).to(dev)
     if seed is not None:
         torch.manual_seed(seed)
 
@@ -141,7 +171,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--w", type=float, default=3.0, help="guidance scale; 1 = plain conditional"
     )
-    p.add_argument("--steps", type=int, default=50, help="DDIM steps; ignored for ddpm")
+    p.add_argument(
+        "--steps",
+        type=int,
+        default=50,
+        help="DDIM steps, or Euler steps for a flow run; ignored for ddpm",
+    )
     p.add_argument("--sampler", default="ddim", choices=("ddim", "ddpm"))
     p.add_argument(
         "--weights", default="ema", choices=("ema", "net"), help="which copy to sample"

@@ -1,4 +1,10 @@
-"""Train the eps-predictor, sample a grid after every epoch.
+"""Train the denoiser, sample a grid after every epoch.
+
+`--objective eps` predicts the noise on a variance-preserving beta schedule
+(DDPM/DDIM); `--objective flow` predicts the velocity along a straight line from
+noise to data (rectified flow, `flow.py`). The loop below is the same either way
+-- it asks the process for a t, an x_t and a target, and never learns which one
+it got -- so the two are comparable at a fixed --seed.
 
 `--dataset mnist` is 28x28 grayscale conditioned on a class label; `--dataset
 colored` is 32x32 RGB conditioned on a caption, and its grid is every colour x
@@ -18,12 +24,12 @@ from torchvision.utils import save_image
 
 from cfg import Guided, drop_labels
 from colored_mnist import VOCAB, ColoredMNIST, position_grid, prompt_grid
-from ddim import DDIMSampler
 from ema import EMA
+from flow import FlowPath
 from forward_process import ForwardProcess
 from loss_by_t import LossByT
 from negatives import per_sample_mse, swap_hinge
-from sampler import DDPMSampler
+from sample import build_sampler
 from two_objects import TwoObjectMNIST, pair_prompt_grid, swap_color_tokens
 from unet import UNet
 from utils import repo_root
@@ -59,13 +65,6 @@ def logger(out: Path):
     return log
 
 
-def build_sampler(fp: ForwardProcess, kind: str, ddim_steps: int):
-    """DDIM at 50 steps costs ~1s a grid against DDPM's ~15s; DDPM stays the
-    reference, since it is the process the loss is actually derived from."""
-    assert kind in ("ddim", "ddpm"), kind
-    return DDPMSampler(fp) if kind == "ddpm" else DDIMSampler(fp, steps=ddim_steps)
-
-
 def cols(cells: list[str], labels: list[str]) -> str:
     """One column per t bucket, header and rows sharing widths so a loss sits
     under the range it belongs to."""
@@ -94,8 +93,12 @@ def main(
     coords: bool = False,
     swap_weight: float = 0.0,
     swap_margin: float = 0.1,
+    objective: str = "eps",
 ):
     assert dataset in ("mnist", "colored", "pair"), dataset
+    assert objective in ("eps", "flow"), objective
+    # an ODE has no variance to pick, so there is nothing for --sampler to choose
+    assert objective == "eps" or sampler == "ddim", "--sampler is an eps choice"
     # the negative is a colour swap, which only names two objects on the pair set
     assert not swap_weight or dataset == "pair", "--swap-weight needs --dataset pair"
     root = repo_root()
@@ -128,7 +131,12 @@ def main(
         ds, batch_size=batch_size, shuffle=True, num_workers=4, drop_last=True
     )
 
-    fp = ForwardProcess(schedule=schedule).to(dev)
+    # the only two lines that know which objective this is. Everything below --
+    # the net, EMA, CFG, the hinge, the grids, the checkpoint -- reads it off
+    # `proc` through sample_t/q_sample/target and never asks again.
+    proc = (
+        FlowPath() if objective == "flow" else ForwardProcess(schedule=schedule)
+    ).to(dev)
     net = UNet(
         in_ch=in_ch,
         num_classes=num_classes or None,
@@ -138,16 +146,18 @@ def main(
         text_layers=text_layers,
         coords=coords,
     ).to(dev)
-    smp = build_sampler(fp, sampler, ddim_steps).to(dev)
+    smp = build_sampler(proc, objective, sampler, ddim_steps).to(dev)
     opt = torch.optim.Adam(net.parameters(), lr=lr)
     ema = EMA(net, ema_decay) if ema_decay else None
-    labels = LossByT(fp.T, loss_buckets).labels
+    labels = LossByT(proc.T, loss_buckets).labels
     log(
         f"out {out}\n"
         f"dataset {dataset}  {len(ds)} images  {in_ch}x{size}x{size}\n"
         f"epochs {epochs}  batch {batch_size}  lr {lr}  n_samples {n_samples}\n"
-        f"sampler {sampler}  {getattr(smp, 'steps', fp.T)} steps  "
-        f"schedule {schedule}\n"
+        f"objective {objective}  "
+        f"sampler {'flow-euler' if objective == 'flow' else sampler}  "
+        f"{getattr(smp, 'steps', proc.T)} steps  "
+        f"schedule {'-' if objective == 'flow' else schedule}\n"
         f"classes {num_classes or 'unconditional'}  "
         f"vocab {vocab_size or '-'}"
         f"{' (pooled into temb)' if vocab_size and pooled_context else ''}"
@@ -197,7 +207,7 @@ def main(
     for epoch in range(1, epochs + 1):
         net.train()
         start = time.time()
-        by_t = LossByT(fp.T, loss_buckets, dev)
+        by_t = LossByT(proc.T, loss_buckets, dev)
         hinge_sum = torch.zeros((), device=dev)
         hinge_n = torch.zeros((), device=dev, dtype=torch.long)
         for x0, y in loader:
@@ -211,25 +221,29 @@ def main(
                 if net.null_label is not None
                 else None
             )
-            t = fp.sample_t(x0.shape[0], dev)
+            t = proc.sample_t(x0.shape[0], dev)
             noise = torch.randn_like(x0)
-            xt = fp.q_sample(x0, t, noise)
+            xt = proc.q_sample(x0, t, noise)
+            # eps under the diffusion process, the velocity eps - x0 under flow
+            # matching. The net's output is whatever this is, and nothing in the
+            # net, the samplers or the wrappers is told which.
+            target = proc.target(x0, noise)
             if swap_weight:
                 # both branches in one doubled batch, as CFG does it
                 yn = swap_color_tokens(y)
                 both = net(torch.cat([xt, xt]), torch.cat([t, t]), torch.cat([y, yn]))
-                eps, eps_neg = both.chunk(2)
+                pred, pred_neg = both.chunk(2)
             else:
-                eps, eps_neg = net(xt, t, y), None
+                pred, pred_neg = net(xt, t, y), None
             # per image, then mean: same gradient as mse_loss, but the split by t
             # survives instead of being pooled away
-            se = per_sample_mse(eps, noise)
+            se = per_sample_mse(pred, target)
             loss = se.mean()
-            if eps_neg is not None:
+            if pred_neg is not None:
                 # a dropped caption is all-null, so its swap is itself and the
                 # hinge would be an unsatisfiable constant on those rows
                 real = (y != net.null_label).any(1)
-                h = swap_hinge(se, per_sample_mse(eps_neg, noise), swap_margin)
+                h = swap_hinge(se, per_sample_mse(pred_neg, target), swap_margin)
                 h = torch.where(real, h, torch.zeros_like(h))
                 n_real = real.sum()
                 # kept on the GPU and read once per epoch: an .item() here is a
@@ -276,7 +290,10 @@ def main(
             {
                 "net": net.state_dict(),
                 "ema": ema.shadow if ema else None,  # None so a loader can tell
-                "fp": fp.state_dict(),  # the schedule rides along as buffers
+                "fp": proc.state_dict(),  # the schedule rides along as buffers
+                # eps or flow: the weights are identical in shape and mean
+                # different things, so a loader that guesses gets noise
+                "objective": objective,
                 # everything a loader needs to rebuild this net; without them the
                 # state_dict keys don't match and the failure is a stack trace
                 "num_classes": num_classes,
@@ -316,7 +333,12 @@ def parse_args() -> argparse.Namespace:
         choices=("ddim", "ddpm"),
         help="sampler for the per-epoch grid",
     )
-    p.add_argument("--ddim-steps", type=int, default=50, help="ignored for ddpm")
+    p.add_argument(
+        "--ddim-steps",
+        type=int,
+        default=50,
+        help="ignored for ddpm; also the Euler step count for --objective flow",
+    )
     p.add_argument(
         "--num-classes",
         type=int,
@@ -340,9 +362,19 @@ def parse_args() -> argparse.Namespace:
         "--schedule",
         default="cosine",
         choices=("linear", "cosine"),
-        help="beta schedule for the forward process",
+        help="beta schedule for the forward process; ignored by --objective flow, "
+        "which has no schedule to pick",
     )
     p.add_argument("--seed", type=int, default=0, help="init, shuffling, and noise")
+    p.add_argument(
+        "--objective",
+        default="eps",
+        choices=("eps", "flow"),
+        help="eps: DDPM/DDIM, predict the noise on a variance-preserving "
+        "schedule. flow: rectified flow, predict the velocity along a straight "
+        "line from noise to data -- no beta schedule, and --sampler and "
+        "--schedule do not apply",
+    )
     p.add_argument(
         "--dataset",
         default="mnist",

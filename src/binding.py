@@ -36,8 +36,7 @@ from torchvision.utils import save_image
 from cfg import Guided
 from colored_mnist import COLORS, DIGITS, decode, encode_batch, read_color
 from compositional import judge_accuracy, train_judge
-from ddim import DDIMSampler
-from sample import load
+from sample import build_sampler, load
 from two_objects import (
     CORNERS,
     SEQ_LEN_PAIR,
@@ -125,7 +124,7 @@ def main(
 ):
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(seed)
-    net, fp, shape, _ = load(run, dev, weights)
+    net, proc, shape, _, objective = load(run, dev, weights)
     assert net.vocab_size is not None, f"{run} is not a captioned run"
 
     judge = train_judge(dev)
@@ -158,8 +157,8 @@ def main(
     )
 
     texts, spec = probe_prompts(prompts, per, seed)
-    print(f"\n{len(texts)} samples from {prompts} prompts, w={w}, {steps} DDIM steps")
-    smp = DDIMSampler(fp, steps=steps).to(dev)
+    print(f"\n{len(texts)} samples from {prompts} prompts, w={w}, {steps} steps")
+    smp = build_sampler(proc, objective, steps=steps).to(dev)
     xs = []
     with torch.no_grad():
         for i in range(0, len(texts), batch):

@@ -29,7 +29,9 @@ class LossByT:
         assert t.shape == per_sample.shape, (t.shape, per_sample.shape)
         # t*n//T, not t//(T//n): the latter overflows into an n+1'th bucket when
         # n does not divide T.
-        b = t * self.n // self.T
+        # .long() because flow matching draws t continuously; on an integer t
+        # this is already exact and the cast is a no-op.
+        b = (t * self.n // self.T).long()
         self.sums.index_add_(0, b, per_sample.detach().float())
         self.counts.index_add_(0, b, torch.ones_like(self.sums[b]))
 

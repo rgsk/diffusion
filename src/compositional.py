@@ -43,8 +43,7 @@ from colored_mnist import (
     read_color,
     read_position,
 )
-from ddim import DDIMSampler
-from sample import load
+from sample import build_sampler, load
 from utils import repo_root
 
 
@@ -154,8 +153,7 @@ def probe_prompts(n: int) -> tuple[list[str], Tensor]:
 
 
 @torch.no_grad()
-def generate(net, fp, texts: list[str], w: float, steps: int, batch: int, dev: str):
-    smp = DDIMSampler(fp, steps=steps).to(dev)
+def generate(net, smp, texts: list[str], w: float, batch: int, dev: str):
     out = []
     for i in range(0, len(texts), batch):
         y = encode_batch(texts[i : i + batch], dev)
@@ -186,7 +184,7 @@ def main(
 ):
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(seed)
-    net, fp, shape, _ = load(run, dev, weights)
+    net, proc, shape, _, objective = load(run, dev, weights)
     assert net.vocab_size is not None, f"{run} is not a captioned run"
     assert shape == (3, 32, 32), shape
 
@@ -198,8 +196,9 @@ def main(
     assert acc > 0.95, f"judge too weak to measure anything: {acc}"
 
     texts, want = probe_prompts(n)
-    print(f"{len(texts)} samples, w={w}, {steps} DDIM steps")
-    x = generate(net, fp, texts, w, steps, batch, dev)
+    print(f"{len(texts)} samples, w={w}, {steps} steps")
+    smp = build_sampler(proc, objective, steps=steps).to(dev)
+    x = generate(net, smp, texts, w, batch, dev)
 
     got = torch.stack(
         [

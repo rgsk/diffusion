@@ -51,6 +51,13 @@ class ForwardProcess(nn.Module):
             + extract(self.sqrt_one_minus_ac, t, x0.shape) * noise
         )
 
+    def target(self, x0: Tensor, noise: Tensor) -> Tensor:
+        """What the net is asked to predict at x_t: the noise itself. Trivial
+        here, and it exists so the training loop reads the objective off the
+        process rather than hard-coding eps -- `flow.py` returns a velocity from
+        the same call."""
+        return noise
+
     def sample_t(self, n: int, device=None) -> Tensor:
         return torch.randint(0, self.T, (n,), device=device)
 

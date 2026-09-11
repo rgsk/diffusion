@@ -1,7 +1,7 @@
 # Diffusion from scratch
 
-DDPM and DDIM built up one piece at a time, on MNIST and a small colored-MNIST
-variant, on a single RTX 4060. One concept per file in `src/`, each with a
+DDPM, DDIM and flow matching built up one piece at a time, on MNIST and a small
+colored-MNIST variant, on a single RTX 4060. One concept per file in `src/`, each with a
 `__main__` that tests it — run any file directly and it checks its own claims.
 
 The point is not the samples. It is what each piece measurably does once it is
@@ -9,7 +9,9 @@ in, which is often not what the paper's summary suggests: the training loss is
 blind to a sampler that has collapsed to a point mass, self-attention buys
 nothing at 28x28, and four rounds of architecture aimed at binding "red" to "3"
 all failed at chance until the objective was changed to ask for it — after which
-the plainest of the four succeeded, having been capable the whole time.
+the plainest of the four succeeded, having been capable the whole time; and
+replacing the whole DDPM formulation with a straight line changes nothing at
+fifty sampling steps and everything at two.
 
 ![conditional samples, one digit per row](docs/conditional_mnist.png)
 
@@ -17,6 +19,7 @@ the plainest of the four succeeded, having been capable the whole time.
 uv sync
 uv run src/main.py --epochs 15 --name first        # train, one sample grid per epoch
 uv run src/sample.py first --label 3 --n 16 --w 3  # ask a trained run for digits
+uv run src/main.py --objective flow --name rect    # straight line instead of DDPM
 uv run src/ddim.py                                 # any file: run it, it tests itself
 ```
 
@@ -176,6 +179,25 @@ grids; `--name scratch` reuses one folder and wipes it each run.
   out (an all-null caption's swap is itself), and the per-epoch `hinge` printed
   beside the loss.
   → [what it showed](#charging-the-loss-for-the-assignment-fixes-it)
+- `flow.py` — flow matching / rectified flow, the SD3/Flux formulation, added as
+  a peer of `forward_process.py` + `sampler.py` rather than a replacement. The
+  path is a straight line, `x_s = (1-s)·x_0 + s·eps`, so the target is its
+  derivative `eps - x_0` — constant along the path, which is what *rectified*
+  means — and sampling is Euler integration of `dx/ds = v` from s=1 to s=0. No
+  betas, no ᾱ, no posterior variance and no x0 clip: the module's `state_dict`
+  is empty, and that emptiness is asserted. `t` is quoted in the same 0..T units
+  as the diffusion schedule, continuous rather than integer, so
+  `timestep_embedding` gets the argument range it was built for and the `loss by
+  t` buckets line up with every earlier run. `main.py --objective flow`; the
+  training loop asks the process for a `t`, an `x_t` and a `target` and never
+  learns which it got, so the net, EMA, CFG, the hinge and both samplers are
+  unchanged.
+  → [what it showed](#flow-matching-against-eps)
+- `objectives.py` — the eps-vs-flow eval. Sweeps sample quality against the
+  number of model calls and against `w`, every cell starting from one shared
+  `x_T`, scored by a CNN judge trained on MNIST. Reports accuracy beside
+  diversity and pinned-pixel fraction, because accuracy alone reads 1.000 on a
+  sampler that has collapsed to one image per class.
 
 ---
 
@@ -879,21 +901,188 @@ and would pay at 64x64. What travels is the method, not the null results:
 fixed.** Six runs and one afternoon say that check is cheap and skipping it is
 not.
 
+## Flow matching against eps
+
+Runs `obj_eps_2026-09-11_17-10-00` vs `obj_flow_2026-09-11_17-22-36`. 15 epochs
+each on MNIST, batch 128, `--seed 0`, class-conditioned, label dropout 0.1,
+cosine schedule on the eps side — identical in every flag but `--objective`.
+4.17M params and **48 s/epoch both**: flow adds no parameters and no time.
+
+The printed losses are 0.0375 and 0.1571 and say nothing against each other —
+eps-MSE and v-MSE score different targets, the same trap as linear against
+cosine. So everything below is measured on generated pixels, scored by a CNN
+judge reading 0.9911 on real MNIST test digits, with one `x_T` shared by every
+cell so the objective is the only variable within a column.
+
+### The whole difference is at low step counts
+
+Label accuracy at w=1, one model call per step:
+
+| model calls | eps (DDIM) | flow (Euler) |
+| --- | --- | --- |
+| 1 | 0.400 | 1.000 † |
+| 2 | **0.406** | **0.994** |
+| 3 | 0.931 | 1.000 |
+| 5 | 0.950 | 0.981 |
+| 10 | 0.969 | 0.981 |
+| 50 | 0.950 | 0.975 |
+| 100 | 0.956 | 0.975 |
+
+![two model calls: eps left, flow right, same x_T](docs/flow_two_steps.png)
+
+*Two model calls each, same `x_T`, same net size, same 15 epochs: eps on the
+left, flow on the right.*
+
+**At 50 steps the two are indistinguishable**, and not only in the number: given
+the same `x_T` the grids show the same digit identities in the same styles, row
+for row. At 2 calls eps is speckle with digits faintly inside it, and flow is
+clean, legible, varied digits.
+
+† **The 1-step cell is a trap.** Accuracy 1.000, diversity 0.038 against real
+data's 0.286 — sixteen near-identical prototypes per row. Perfect obedience out
+of a collapsed sampler, the same blindness the no-noise DDPM chain showed in the
+first section: the score cannot see it and the grid can.
+
+And it is not merely blurry, it is exactly the average: scored against the true
+per-class mean of the MNIST training set, the 1-step output sits at **MSE 0.0005,
+correlation 0.999**, where the 50-step output is at 0.0140 and **0.964 — which
+is the real-image control, 0.961**, to within noise. Sixteen real digits averaged
+do not quite reach their class mean either; sixteen copies of the mean do. The
+model is correctly drawing `E[x_0 | class]` and nothing else, which is what a
+squared-error loss asks for and is taken up under [what's next](#whats-next).
+
+So diversity is the honest column at the low end, and it recovers monotonically:
+
+| model calls | 1 | 2 | 5 | 10 | 50 | real data |
+| --- | --- | --- | --- | --- | --- | --- |
+| flow diversity | 0.038 | 0.155 | 0.235 | 0.257 | 0.275 | 0.286 |
+| corr with class mean | 0.999 | 0.959 | 0.965 | 0.965 | 0.964 | 0.961 |
+
+(`objectives.py` prints the real-image row as a control on every run: the same
+statistics over 16 *real* images per class, which is what a perfect sampler
+would score rather than 1.000.)
+
+That is the Euler truncation error `flow.py`'s oracle test already predicts —
+recovered std 0.199 / 0.371 / 0.429 / 0.487 against a true 0.5 at 2/5/10/50
+steps. The unit test and the trained run agree about what a short grid costs.
+
+**The obvious confound, checked.** DDIM's grid is `linspace(T-1, 0, steps)`, so
+at 2 steps it visits {999, 0} and its second call lands where ᾱ ≈ 1 and does
+almost nothing — one useful call against flow's two. Matched on *useful* calls
+instead, flow at 2 (0.994) still beats eps at 3 (0.931). The gap survives the
+correction, smaller. Part of what the low end measures is DDIM's choice of grid,
+not only the straightness of the path.
+
+### The loss stops hiding things
+
+Final epoch, the same `t` buckets both runs print:
+
+| | 0-99 | 300-399 | 600-699 | 900-999 | span |
+| --- | --- | --- | --- | --- | --- |
+| eps | 0.1148 | 0.0379 | 0.0213 | 0.0019 | 60x |
+| flow | 0.1591 | 0.1003 | 0.1607 | 0.2398 | 2.5x |
+
+eps spans 60x and falls monotonically, so its pooled scalar is a low-`t` average
+and a gain anywhere else is invisible in it — the problem four sections above
+are written around. Flow spans 2.5x and is **U-shaped**, hardest at both ends:
+at s=0 the velocity has to be predicted from clean data, at s=1 from pure noise,
+and the middle is where both are legible. The pooled number is much closer to
+meaning what it says.
+
+It also says uniform `t` is the wrong sampling distribution — draws are being
+spent on the easy middle. That is exactly what SD3 fixes with logit-normal `t`,
+and this run is now the control for it.
+
+### No clip, and the contrast comes out right
+
+Real MNIST has 0.814 of its pixels pinned at ±1. At 50 steps:
+
+| w | eps pinned | flow pinned |
+| --- | --- | --- |
+| 1.0 | 0.201 | 0.423 |
+| 3.0 | 0.189 | 0.661 |
+| 8.0 | 0.081 | 0.835 |
+| 15.0 | 0.054 | 0.808 |
+
+Guidance drives the two in opposite directions: eps thins toward a washed-out
+image, flow sharpens toward the data's own contrast. The CFG section above
+recorded the eps half of this and read it as strokes eroding — that is not a
+property of guidance, it is a property of the objective guidance is applied to.
+
+And flow never clips. DDIM has to clamp x0 every step because 1/sqrt(ᾱ_999) is
+157; Euler's coefficients here sum to 1, so there is nothing to rescue. Flow's
+unclipped range tightened on its own across training — [-1.31, 1.29] at epoch 1
+to [-1.03, 1.04] at epoch 15 — while DDIM sits at exactly [-1.00, 1.00] because
+it clamps.
+
+Guidance is otherwise unchanged, as predicted: CFG is arithmetic on the net's
+output and does not know what that output means. Both hit 1.000 accuracy by w=2,
+both lose diversity monotonically to w=8.
+
+Caveats. One seed per objective, so part of every gap is seed — the low-step
+differences are far too large to be that, the 50-step ones are not, which is
+part of why they are reported as a tie. The accuracy column conflates the model
+getting the label right with the judge reading it right, and the judge is itself
+at 0.9911 on real digits — so anything above ~0.97 there sits within a point or
+two of the ruler's own error, and only differences well outside that mean
+anything. The low-step cells are the ones this table can actually resolve.
+And MNIST at 28x28 is the easiest case there is for few-step sampling: the SD3
+result is on far harder data, where the low-step advantage is worth more and
+the 50-step tie should not be expected to hold.
+
 ---
 
 # What's next
 
-Ordered. The binding thread is closed; (1) is the one that moves this project
-forward rather than sideways.
+Ordered. (1) to (3) are the flow-matching thread this project has just opened,
+and all three have their control already run.
 
-1. **Flow matching / rectified flow** — DDPM/DDIM is the SD1/SD2-era
-   formulation; SD3 and Flux use a straight-line path from noise to data,
-   predicting velocity instead of eps. Simpler than what is already written —
-   no beta schedule, no posterior-variance algebra — and it slots in beside
-   `sampler.py` as a peer, sharing the same U-Net. The item that makes this
-   project about image generation as practised now rather than as it was.
+1. **Logit-normal `t` for flow matching** — the bucketed loss above is U-shaped,
+   which says uniform `t` spends most of its draws on the easy middle of the
+   path. SD3 samples `t` logit-normally to concentrate them at the hard ends,
+   and it is the one piece of that formulation this repo has not copied. One
+   flag, one run, and `obj_flow` is the control. `flow.py`'s `sample_t` is the
+   only thing that changes.
 
-2. **Measure the speed knobs** — every run here is fp32 at batch 64 on an 8GB
+2. **Reflow, and what one-step generation would actually take** — the 1-step
+   cell above is not a blurry digit, it *is* the class mean, at correlation
+   0.999 where real images score 0.961. That is forced rather than
+   undertrained: `x_0` and `eps` are paired independently, so over the epochs
+   the same noise is matched with a 3, an 8 and a 5, and a squared-error loss
+   asked for the average direction answers "toward the mean" correctly. Every
+   training line is straight and they cross each other everywhere; a field can
+   hold only one direction at a crossing, so the *learned* field bends even
+   though nothing it was trained on did. That bend is the whole low-step gap —
+   rectified flow straightens each sample's path, not the field the model ends
+   up with.
+
+   Reflow attacks the pairing instead of the model: sample noise, run the full
+   50-step ODE, keep the `(eps, x_0)` pairs it produced, retrain on those. Each
+   noise is then matched to the one image the model's own ODE already sends it
+   to, the lines cross far less, and the field moves closer to constant along a
+   trajectory. Same objective, same training loop, a different set of couplings
+   — and the marginals are unchanged, so it is not trading correctness for
+   speed. Cheap here: one generation pass over 60k pairs, then a retrain.
+
+   Stated in advance, the way the binding thread states them: **1-step diversity
+   should move off 0.038 toward the data's 0.286, and the 1-step correlation
+   with the class mean should fall from 0.999 to the real-image control's
+   0.961.** `objectives.py` prints both columns and that control already.
+
+   What reflow would *not* buy is sharpness — any regression onto a target
+   pulls toward an average, so it makes one step feasible while a
+   distributional loss (progressive distillation, consistency models,
+   adversarial distillation) is what makes one step sharp. That is where this
+   thread stops being about diffusion.
+
+3. **Flow matching on `--dataset pair`** — the whole binding thread ran under
+   eps, so "the objective was the bottleneck" is currently a claim about *one*
+   objective. The hinge is a share of per-sample error and knows nothing about
+   what is being predicted, so it should transfer unchanged; if it does not,
+   that is more interesting than if it does. Two runs with and without
+   `--swap-weight`, against the four eps runs already in the table above.
+
+4. **Measure the speed knobs** — every run here is fp32 at batch 64 on an 8GB
    4060, and a scratch benchmark of the training step suggests that is leaving a
    lot on the table: 173 s/epoch as run, against 135 with bf16 autocast, 123
    adding `channels_last`, and 80 adding `torch.compile`. Those are step timings
@@ -904,7 +1093,7 @@ forward rather than sideways.
    that probe on memory the compile run had not released, so what batch 128
    actually costs is still unknown.
 
-3. **`cross + text encoder + hinge`** — the one untested cell of the ablation.
+5. **`cross + text encoder + hinge`** — the one untested cell of the ablation.
    The encoder is shown to be unnecessary for binding, not useless; this says
    whether it helps, interferes, or does nothing, and it is one run.
 
